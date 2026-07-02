@@ -7,13 +7,9 @@
 
 float health_change = 0.0f;
 void HealthMenu::Create() {
-    Button("LOG SUIT HEALTH", "Print the current suit health fraction.", [](){
-        DEBUG("Suit health fraction: %.3f", SuitDamageManager::GetSuitHealthFraction());
-    });
-    
-    Button("REPAIR SUIT", "Restore suit health to full.", [](){
-        SuitDamageManager::RepairSuit();
-    });
+
+
+    Header("DECAY SETTINGS");
 
     static int decay_enabled = SuitDamageManager::IsDecayEnabled() ? 1 : 0;
     Toggle("DECAY ENABLED", "Enable or disable suit decay.", &decay_enabled, [&](){
@@ -43,6 +39,56 @@ void HealthMenu::Create() {
     Slider("DECAY INTERVAL", "Update interval for suit decay in milliseconds.", &decay_interval, interval_opts, [&](){
         SuitDamageManager::SetDecayInterval(static_cast<int>(decay_interval));
     });
+    
+
+
+    Header("DAMAGE SETTINGS");
+
+    static float damage_multiplier = SuitDamageManager::GetDamageMultiplier();
+
+    SliderOpts mult_opts;
+    mult_opts.min = 0.0f;
+    mult_opts.max = 5.0f;     // Allow up to 5x damage
+    mult_opts.display_min = 0; 
+    mult_opts.display_max = 500; // Displays as 0% to 500%
+    mult_opts.step = 0.1f;
+    
+    Slider("DAMAGE MULTIPLIER", "Adjust how much damage the suit takes (1.0 = Normal, 2.0 = Double Damage).", &damage_multiplier, mult_opts, [&](){
+        SuitDamageManager::SetDamageMultiplier(damage_multiplier);
+    });
+
+    // --- HEAL CONTROLS ---
+    Header("AUTO-REPAIR SETTINGS");
+
+    static int heal_enabled = SuitDamageManager::IsHealEnabled() ? 1 : 0;
+    Toggle("AUTO-HEAL ENABLED", "Slowly repairs the suit over time.", &heal_enabled, [&](){
+        SuitDamageManager::SetHealEnabled(heal_enabled != 0);
+    });
+
+    static float heal_rate = static_cast<float>(SuitDamageManager::GetHealRate());
+    static float heal_interval = static_cast<float>(SuitDamageManager::GetHealInterval());
+
+    SliderOpts h_rate_opts;
+    h_rate_opts.min = 0.0f;
+    h_rate_opts.max = 100.0f;
+    h_rate_opts.display_min = 0;
+    h_rate_opts.display_max = 100;
+    h_rate_opts.step = 1.0f;
+    Slider("HEAL RATE", "Suit heal rate in units per tick.", &heal_rate, h_rate_opts, [&](){
+        SuitDamageManager::SetHealRate(static_cast<int>(heal_rate));
+    });
+
+    SliderOpts h_interval_opts;
+    h_interval_opts.min = 100.0f;
+    h_interval_opts.max = 5000.0f; // Allow up to 5 seconds for slow healing
+    h_interval_opts.display_min = 100;
+    h_interval_opts.display_max = 5000;
+    h_interval_opts.step = 100.0f;
+    Slider("HEAL INTERVAL", "Update interval for suit healing in milliseconds.", &heal_interval, h_interval_opts, [&](){
+        SuitDamageManager::SetHealInterval(static_cast<int>(heal_interval));
+    });
+
+    Header("SUIT SETTINGS");
 
     SliderOpts percent_opts;
     percent_opts.min = 0.0f;
@@ -62,7 +108,10 @@ void HealthMenu::Create() {
         SuitDamageManager::ApplySuitRepair(0.1f);
     });
 
+
+
     Header("SUIT SHORTCUTS");
+
     Button("FULL HEALTH (F5)", "Set the suit to full health.", [](){
         SuitDamageManager::SetSuitHealthFraction(1.0f);
     });
@@ -74,5 +123,13 @@ void HealthMenu::Create() {
     });
     Button("DESTROYED (F8)", "Set the suit health to 0%.", [](){
         SuitDamageManager::SetSuitHealthFraction(0.0f);
+    });
+
+
+
+    Header("DEBUG");
+
+    Button("LOG SUIT HEALTH", "Print the current suit health fraction.", [](){
+        DEBUG("Suit health fraction: %.3f", SuitDamageManager::GetSuitHealthFraction());
     });
 }

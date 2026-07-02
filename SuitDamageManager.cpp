@@ -22,6 +22,7 @@ uintptr_t g_hook_target = 0;
 bool g_hook_installed = false;
 
 std::atomic<bool> g_accumulate_damage{true}; 
+std::atomic<float> g_damage_multiplier{1.0f};
 float g_suit_value = 1.0f;
 
 namespace {
@@ -42,6 +43,11 @@ namespace {
     std::atomic<int> g_decay_interval{500};
     std::thread g_worker;
     std::array<bool, kNumHotkeys> g_last_key_state{};
+
+    // --- NEW HEAL GLOBALS ---
+    std::atomic<bool> g_heal_enabled{false};
+    std::atomic<int> g_heal_rate{5};      // Default heal rate
+    std::atomic<int> g_heal_interval{1000}; // Default heal interval (1 second)
 
     std::mutex g_suit_mutex;
     std::ofstream g_debug_log;
@@ -67,8 +73,19 @@ namespace {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
+            // If the game is trying to damage us...
             if (game_intended_value < g_suit_value) {
-                g_suit_value = game_intended_value; 
+                
+                // 1. Calculate exactly how much damage the game WANTED to do
+                float damage_taken = g_suit_value - game_intended_value;
+                
+                // 2. Multiply that damage
+                float mult = g_damage_multiplier.load(std::memory_order_relaxed);
+                float final_damage = damage_taken * mult;
+                
+                // 3. Apply it to our suit and clamp it so it doesn't go below 0.0
+                g_suit_value = g_suit_value - final_damage;
+                if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
         } else {
             g_suit_value = game_intended_value; 
@@ -237,6 +254,23 @@ namespace {
         SetSuitFraction(new_fraction);
     }
 
+    void SetHealRateInternal(int rate) { g_heal_rate.store(std::clamp(rate, kMinRate, kMaxRate), std::memory_order_relaxed); }
+    void SetHealIntervalInternal(int interval) { g_heal_interval.store(std::clamp(interval, kMinInterval, kMaxInterval), std::memory_order_relaxed); }
+
+    void ApplyHeal() {
+        if (!g_heal_enabled.load(std::memory_order_relaxed)) return;
+        int rate = g_heal_rate.load(std::memory_order_relaxed);
+        if (rate <= 0) return;
+
+        float current_fraction = GetCurrentSuitFraction();
+        
+        // REVERSED LOGIC: Add the rate instead of subtracting
+        float new_fraction = current_fraction + (rate / 1000.0f);
+        if (new_fraction > 1.0f) new_fraction = 1.0f; // Clamp to max health
+
+        SetSuitFraction(new_fraction);
+    }
+
     void WorkerThread() {
         LogHookStatus("WorkerThread booted successfully.");
         if (kEnableInstructionPatch) {
@@ -245,15 +279,26 @@ namespace {
             InstallSuitDamageHook();
         }
 
-        DWORD last_tick = GetTickCount();
+        // Track both ticks independently
+        DWORD last_decay_tick = GetTickCount();
+        DWORD last_heal_tick = GetTickCount();
+
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
-
             DWORD now = GetTickCount();
-            int interval = g_decay_interval.load(std::memory_order_relaxed);
-            if (now - last_tick >= static_cast<DWORD>(interval)) {
-                last_tick = now;
+
+            // Process Decay Timer
+            int d_interval = g_decay_interval.load(std::memory_order_relaxed);
+            if (now - last_decay_tick >= static_cast<DWORD>(d_interval)) {
+                last_decay_tick = now;
                 ApplyDecay();
+            }
+
+            // Process Heal Timer
+            int h_interval = g_heal_interval.load(std::memory_order_relaxed);
+            if (now - last_heal_tick >= static_cast<DWORD>(h_interval)) {
+                last_heal_tick = now;
+                ApplyHeal();
             }
 
             Sleep(16);
@@ -300,6 +345,8 @@ namespace SuitDamageManager {
     int GetDecayInterval() { return g_decay_interval.load(std::memory_order_relaxed); }
     float GetSuitHealthFraction() { return GetCurrentSuitFraction(); }
     float GetSuitHealthPercent() { return GetCurrentSuitFraction() * 100.0f; }
+    float GetDamageMultiplier();
+    void SetDamageMultiplier(float multiplier);
 
     float GetTimeToDestroyedSeconds() {
         int rate = GetDecayRate();
@@ -318,4 +365,13 @@ namespace SuitDamageManager {
     void SetSuitHealthPercent(float percent) { SetSuitFraction(std::clamp(percent / 100.0f, 0.0f, 1.0f)); }
     void ApplySuitDamage(float amount) { ApplySuitDamageInternal(amount); }
     void ApplySuitRepair(float amount) { ApplySuitRepairInternal(amount); }
+    float GetDamageMultiplier() { return g_damage_multiplier.load(std::memory_order_relaxed); }
+    void SetDamageMultiplier(float multiplier) { g_damage_multiplier.store(multiplier, std::memory_order_relaxed); }
+    bool IsHealEnabled() { return g_heal_enabled.load(std::memory_order_relaxed); }
+    int GetHealRate() { return g_heal_rate.load(std::memory_order_relaxed); }
+    int GetHealInterval() { return g_heal_interval.load(std::memory_order_relaxed); }
+    
+    void SetHealEnabled(bool enabled) { g_heal_enabled.store(enabled, std::memory_order_relaxed); }
+    void SetHealRate(int rate) { SetHealRateInternal(rate); }
+    void SetHealInterval(int interval) { SetHealIntervalInternal(interval); }
 }
