@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+project(scripttemplate)
+include_directories(include)
+link_directories(lib)
+add_definitions(-DLOGLEVEL=4)
+file(GLOB_RECURSE src CONFIGURE_DEPENDS "*.h" "*.cpp")
+add_library(scripttemplate SHARED ${src} SuitHook.asm)
+target_link_libraries(scripttemplate libMinHook.x64 modsettings)
+# Enable Microsoft Macro Assembler
+enable_language(ASM_MASM)
