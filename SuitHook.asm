@@ -19,19 +19,30 @@ SuitDamageHookDetourAsm PROC
     movdqu [rsp+10h], xmm2
     movdqu [rsp+20h], xmm3
 
-    ; 3. Call our C++ logic (requires 28h shadow space for Windows x64)
-    mov rcx, rax
-    sub rsp, 28h 
-    call SuitDamageLogic
-    add rsp, 28h
+    ; 3. Setup arguments for C++
+    mov rcx, rax       ; Argument 1: The suit pointer
+    movss xmm1, xmm0   ; Argument 2: The game's intended suit float
 
-    ; 4. Restore the XMM graphics registers perfectly
+    ; 4. ALIGN THE STACK TO 16 BYTES (The Crash Fix)
+    push rbp           ; Save RBP (non-volatile register)
+    mov rbp, rsp       ; Backup the exact unaligned stack pointer
+    and rsp, -16       ; Force 16-byte alignment (0xFFFFFFFFFFFFFFF0)
+    sub rsp, 20h       ; Allocate 32 bytes of shadow space for C++
+
+    ; 5. Call our C++ logic safely
+    call SuitDamageLogic
+
+    ; 6. RESTORE THE UNALIGNED STACK
+    mov rsp, rbp       ; Restore the exact stack pointer
+    pop rbp            ; Restore RBP
+
+    ; 7. Restore the XMM graphics registers perfectly
     movdqu xmm1, [rsp]
     movdqu xmm2, [rsp+10h]
     movdqu xmm3, [rsp+20h]
     add rsp, 48h
 
-    ; 5. Restore standard registers
+    ; 8. Restore standard registers
     pop r11
     pop r10
     pop r9
@@ -40,10 +51,10 @@ SuitDamageHookDetourAsm PROC
     pop rcx
     pop rax
 
-    ; 6. Execute original AVX instruction + NOP
+    ; 9. Execute original AVX instruction + NOP
     DB 0C5h, 0F8h, 011h, 000h, 090h
 
-    ; 7. Jump back into the game safely
+    ; 10. Jump back into the game safely
     jmp qword ptr [g_return_address]
 
 SuitDamageHookDetourAsm ENDP
