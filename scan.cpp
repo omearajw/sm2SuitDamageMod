@@ -37,7 +37,7 @@ Scan::Pattern Scan::Parse(const char* pattern) {
 }
 
 Scan::ScanResult Scan::Internal::ScanModule(const char* moduleName, Scan::Pattern pattern) {
-    if (ScanCache.contains(pattern)) {
+    if (ScanCache.find(pattern) != ScanCache.end()) {
         DEBUG("Cached pattern found.");
         return ScanCache[pattern];
     }

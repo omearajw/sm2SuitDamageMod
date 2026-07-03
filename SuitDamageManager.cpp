@@ -2,6 +2,7 @@
 
 #include "hooking.h"
 #include "logging.h"
+#include "scan.h"
 
 #include <Windows.h>
 #include <array>
@@ -66,29 +67,48 @@ namespace {
         }
     }
 
+    // Tracks the game's internal math state
+    std::atomic<float> g_last_game_intended_value{1.0f};
+    uintptr_t g_last_pointer = 0;
+
     // --- THE LOGIC BRIDGE ---
     extern "C" float SuitDamageLogic(uintptr_t pointer, float game_intended_value) {
-        g_player_pointer = pointer; 
-        
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         
+        // 1. Did the memory pointer change? (e.g., Loaded a save or changed suits)
+        // We reset our trackers here so we don't accidentally apply massive damage on load.
+        if (pointer != g_last_pointer) {
+            g_last_pointer = pointer;
+            g_player_pointer = pointer; 
+            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
+        }
+        
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
-            // If the game is trying to damage us...
-            if (game_intended_value < g_suit_value) {
+            
+            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
+            
+            // 2. We ONLY take damage if the game's internal math drops compared to ITS OWN previous state.
+            if (game_intended_value < last_val) {
                 
-                // 1. Calculate exactly how much damage the game WANTED to do
-                float damage_taken = g_suit_value - game_intended_value;
+                // Calculate the exact delta (how hard the punch was)
+                float damage_taken = last_val - game_intended_value;
                 
-                // 2. Multiply that damage
+                // Apply the multiplier from your UI menu
                 float mult = g_damage_multiplier.load(std::memory_order_relaxed);
                 float final_damage = damage_taken * mult;
                 
-                // 3. Apply it to our suit and clamp it so it doesn't go below 0.0
+                // Damage our fully independent suit value
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
+            
+            // 3. Always sync our tracker to the game's current internal state
+            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
+            
         } else {
+            // Standard passthrough if the mod is turned off
             g_suit_value = game_intended_value; 
+            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
 
         return g_suit_value; 
@@ -141,12 +161,28 @@ namespace {
             LogHookStatus("CRITICAL ERROR: Could not find Spider-Man2.exe module.");
             return false;
         }
-
+        
         uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
-        g_hook_target = base_address + 0xEE72C2;
+
+        // 1. A slightly shorter, much more forgiving signature
+        const char* signature = "C5 F8 11 00 90 44 89 35 ?? ?? ?? ?? 48 8B CB";
+        
+        // 2. Attempt the dynamic scan for Nexus users
+        Scan::ScanResult result = Scan::Internal::ScanModule("Spider-Man2.exe", signature);
+        
+        if (!result.found) {
+            LogHookStatus("WARNING: Pattern scan failed. Falling back to hardcoded offset.");
+            // 3. THE FALLBACK: If the scan fails, guarantee it works on your exact machine!
+            g_hook_target = base_address + 0xEE72C2;
+        } else {
+            g_hook_target = result.loc;
+            LogHookStatus("SUCCESS: Pattern found at dynamic address!");
+        }
+
         g_return_address = g_hook_target + 5; 
 
-        LogHookStatus("Resolving base address and trampoline allocation...");
+        // 4. Proceed with the memory trampoline...
+        LogHookStatus("Resolving trampoline allocation...");
         void* trampoline = AllocateNear(g_hook_target);
         if (!trampoline) return false;
 
