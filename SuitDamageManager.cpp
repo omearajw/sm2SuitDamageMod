@@ -52,6 +52,9 @@ namespace {
 
     std::mutex g_suit_mutex;
     std::ofstream g_debug_log;
+
+    // Tracks the last known suit hash/state
+    std::atomic<uint32_t> g_last_suit_id{0};
     
     constexpr bool kEnableInstructionPatch = true;
     constexpr DWORD kHookInstallDelayMs = 3000;
@@ -315,26 +318,41 @@ namespace {
             InstallSuitDamageHook();
         }
 
-        // Track both ticks independently
-        DWORD last_decay_tick = GetTickCount();
-        DWORD last_heal_tick = GetTickCount();
+        // 1. Get the base address of the game for our static offset
+        HMODULE game_module = GetModuleHandleA("Spider-Man2.exe");
+        uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
+        
+        // 2. Calculate the exact pointer you found in Cheat Engine
+        uintptr_t suit_id_pointer = base_address + 0xAFB6EE8;
 
+        DWORD last_tick = GetTickCount();
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
-            DWORD now = GetTickCount();
 
-            // Process Decay Timer
-            int d_interval = g_decay_interval.load(std::memory_order_relaxed);
-            if (now - last_decay_tick >= static_cast<DWORD>(d_interval)) {
-                last_decay_tick = now;
-                ApplyDecay();
+            // --- THE WARDROBE CLEANSE ---
+            if (base_address != 0) {
+                // Read the current 4-byte Suit ID / State from memory
+                uint32_t current_suit_id = *reinterpret_cast<uint32_t*>(suit_id_pointer);
+                
+                // If it's different from the last frame, the player changed suits!
+                if (current_suit_id != g_last_suit_id.load(std::memory_order_relaxed)) {
+                    
+                    // Don't repair on the very first frame of the game loading
+                    if (g_last_suit_id.load(std::memory_order_relaxed) != 0) {
+                        SetSuitFraction(1.0f); 
+                        LogHookStatus("Suit change detected! Wardrobe Cleanse applied.");
+                    }
+                    
+                    // Sync the tracker
+                    g_last_suit_id.store(current_suit_id, std::memory_order_relaxed);
+                }
             }
 
-            // Process Heal Timer
-            int h_interval = g_heal_interval.load(std::memory_order_relaxed);
-            if (now - last_heal_tick >= static_cast<DWORD>(h_interval)) {
-                last_heal_tick = now;
-                ApplyHeal();
+            DWORD now = GetTickCount();
+            int interval = g_decay_interval.load(std::memory_order_relaxed);
+            if (now - last_tick >= static_cast<DWORD>(interval)) {
+                last_tick = now;
+                ApplyDecay(); // Or ApplyHeal, depending on the preset
             }
 
             Sleep(16);
