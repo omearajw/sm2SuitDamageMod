@@ -3,6 +3,9 @@
 #include "hooking.h"
 #include "logging.h"
 #include "scan.h"
+#include "game\HeroSystem.h"
+#include "game\Actor.h"
+#include "game\Transform.h"
 
 #include <Windows.h>
 #include <array>
@@ -25,6 +28,12 @@ bool g_hook_installed = false;
 std::atomic<bool> g_accumulate_damage{true}; 
 std::atomic<float> g_damage_multiplier{1.0f};
 float g_suit_value = 1.0f;
+
+extern "C" {
+    uintptr_t g_player_base = 0;
+    uintptr_t g_coord_return = 0;
+    void MasterCoordinateHookAsm();
+}
 
 namespace {
     constexpr int kMinRate = 0;
@@ -55,6 +64,8 @@ namespace {
 
     // Tracks the last known suit hash/state
     std::atomic<uint32_t> g_last_suit_id{0};
+
+    
     
     constexpr bool kEnableInstructionPatch = true;
     constexpr DWORD kHookInstallDelayMs = 3000;
@@ -226,6 +237,40 @@ namespace {
         g_return_address = 0;
     }
 
+    bool InstallCoordinateHook() {
+        LogHookStatus("Attempting to install Master Coordinate Stealer...");
+
+        HMODULE game_module = GetModuleHandleA("Spider-Man2.exe");
+        if (!game_module) return false;
+
+        uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
+
+        // The absolute global Z-coordinate writer
+        uintptr_t hook_target = base_address + 0x30EEB11; 
+        g_coord_return = hook_target + 5; // Perfect 5-byte fit!
+        
+        void* trampoline = AllocateNear(hook_target);
+        if (trampoline) {
+            uint8_t* t = reinterpret_cast<uint8_t*>(trampoline);
+            t[0] = 0xFF; t[1] = 0x25; t[2] = 0x00; t[3] = 0x00; t[4] = 0x00; t[5] = 0x00;
+            *reinterpret_cast<uintptr_t*>(t + 6) = reinterpret_cast<uintptr_t>(&MasterCoordinateHookAsm);
+
+            DWORD old_protect;
+            VirtualProtect(reinterpret_cast<LPVOID>(hook_target), 5, PAGE_EXECUTE_READWRITE, &old_protect);
+            
+            uint8_t* p = reinterpret_cast<uint8_t*>(hook_target);
+            p[0] = 0xE9; 
+            *reinterpret_cast<int32_t*>(p + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(trampoline) - hook_target - 5);
+            
+            // NO PADDING NEEDED!
+            
+            VirtualProtect(reinterpret_cast<LPVOID>(hook_target), 5, old_protect, &old_protect);
+            LogHookStatus("SUCCESS: Master Global Coordinate Hook installed.");
+            return true;
+        }
+        return false;
+    }
+
     float GetCurrentSuitFraction() {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         return g_suit_value;
@@ -239,6 +284,14 @@ namespace {
         if (g_player_pointer != 0) {
             *reinterpret_cast<float*>(g_player_pointer) = g_suit_value;
         }
+    }
+
+    bool IsInPetersHouse(Vector3 pos) {
+        bool insideX = (pos.x >= 2574.5f && pos.x <= 2611.5f);
+        bool insideY = (pos.y >= 1.0f && pos.y <= 14.5f); // Floor lowered
+        bool insideZ = (pos.z >= -908.0f && pos.z <= -885.0f);
+
+        return (insideX && insideY && insideZ);
     }
 
     void RepairSuitInternal() { SetSuitFraction(1.0f); }
@@ -262,18 +315,15 @@ namespace {
             bool down = IsKeyDown(kHotkeyVks[index]);
             if (down && !g_last_key_state[index]) {
                 switch (index) {
-                    case 0: SetDecayRateInternal(g_decay_rate.load(std::memory_order_relaxed) + 1); ShowNotification("Decay Rate: increased"); break;
-                    case 1: SetDecayRateInternal(g_decay_rate.load(std::memory_order_relaxed) - 1); ShowNotification("Decay Rate: decreased"); break;
-                    case 2: SetDecayIntervalInternal(g_decay_interval.load(std::memory_order_relaxed) + 100); ShowNotification("Decay Interval: increased"); break;
-                    case 3: SetDecayIntervalInternal(g_decay_interval.load(std::memory_order_relaxed) - 100); ShowNotification("Decay Interval: decreased"); break;
+                    case 0: break;
+                    case 1: break;
+                    case 2: break;
+                    case 3: break;
                     case 4: SetSuitFraction(1.0f); ShowNotification("Suit: Full Health"); break;
                     case 5: SetSuitFraction(0.5f); ShowNotification("Suit: 50% Damaged"); break;
                     case 6: SetSuitFraction(0.1f); ShowNotification("Suit: Critical"); break;
                     case 7: SetSuitFraction(0.0f); ShowNotification("Suit: Destroyed"); break;
-                    case 8: 
-                        g_decay_enabled.store(!g_decay_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed); 
-                        ShowNotification(g_decay_enabled.load(std::memory_order_relaxed) ? "Suit Decay: ON" : "Suit Decay: OFF"); 
-                        break;
+                    case 8: break;
                     case 9: ShowNotification("F10 pressed"); break;
                 }
             }
@@ -316,47 +366,77 @@ namespace {
             LogHookStatus("Delaying hook install by 3000ms...");
             Sleep(kHookInstallDelayMs);
             InstallSuitDamageHook();
+            InstallCoordinateHook(); 
         }
 
-        // 1. Get the base address of the game for our static offset
         HMODULE game_module = GetModuleHandleA("Spider-Man2.exe");
         uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
-        
-        // 2. Calculate the exact pointer you found in Cheat Engine
         uintptr_t suit_id_pointer = base_address + 0xAFB6EE8;
 
         DWORD last_tick = GetTickCount();
+        DWORD last_log_tick = 0; 
+
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
 
-            // --- THE WARDROBE CLEANSE ---
+            // --- 1. THE WARDROBE CLEANSE ---
             if (base_address != 0) {
-                // Read the current 4-byte Suit ID / State from memory
                 uint32_t current_suit_id = *reinterpret_cast<uint32_t*>(suit_id_pointer);
-                
-                // If it's different from the last frame, the player changed suits!
                 if (current_suit_id != g_last_suit_id.load(std::memory_order_relaxed)) {
-                    
-                    // Don't repair on the very first frame of the game loading
                     if (g_last_suit_id.load(std::memory_order_relaxed) != 0) {
-                        SetSuitFraction(1.0f); 
                         LogHookStatus("Suit change detected! Wardrobe Cleanse applied.");
                     }
-                    
-                    // Sync the tracker
                     g_last_suit_id.store(current_suit_id, std::memory_order_relaxed);
                 }
             }
 
-            DWORD now = GetTickCount();
-            int interval = g_decay_interval.load(std::memory_order_relaxed);
-            if (now - last_tick >= static_cast<DWORD>(interval)) {
-                last_tick = now;
-                ApplyDecay(); // Or ApplyHeal, depending on the preset
+            // Inside WorkerThread()...
+            if (GetAsyncKeyState(VK_F9) & 0x8000) {
+                DWORD now = GetTickCount();
+                if (now - last_log_tick > 1000) { 
+                    
+                    // 1. Get the game's Hero System
+                    HeroSystem* hero_sys = GetHeroSystem();
+                    if (hero_sys != nullptr) {
+                        
+                        // 2. Ask the system for Peter's master entity
+                        Actor* peter = hero_sys->GetHero();
+                        if (peter != nullptr) {
+                            
+                            // 3. Grab his absolute 3D position directly from his Transform component
+                            Vector3 pos = peter->GetPosition();
+                            
+                            char log_buffer[256];
+                            snprintf(log_buffer, sizeof(log_buffer), 
+                                "NATIVE SDK COORDS -> X: %.2f | Y: %.2f | Z: %.2f", 
+                                pos.x, pos.y, pos.z);
+                                
+                            LogHookStatus(log_buffer);
+                        } else {
+                            LogHookStatus("HeroSystem found, but Peter's Actor is currently null (Loading/Dead?).");
+                        }
+                    } else {
+                        LogHookStatus("HeroSystem is not initialized yet.");
+                    }
+                    
+                    last_log_tick = now;
+                }
             }
+            HeroSystem* hero_sys = GetHeroSystem();
+            if (hero_sys != nullptr) {
+                Actor* peter = hero_sys->GetHero();
+                if (peter != nullptr) {
+                    Vector3 pos = peter->GetPosition();
 
-            Sleep(16);
-        }
+                    if (IsInPetersHouse(pos)) {
+                        // Turn ON the gradual heal while inside
+                        SuitDamageManager::SetHealEnabled(true);
+                    } else {
+                        // Turn OFF the gradual heal the moment he steps outside
+                        SuitDamageManager::SetHealEnabled(false);
+                    }
+                }
+            }
         LogHookStatus("WorkerThread shutting down.");
     }
 }

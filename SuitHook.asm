@@ -1,8 +1,16 @@
 PUBLIC SuitDamageHookDetourAsm
+PUBLIC MasterCoordinateHookAsm
+
 EXTERN SuitDamageLogic : PROC
 EXTERN g_return_address : QWORD
+EXTERN g_player_base: QWORD
+EXTERN g_coord_return: QWORD
 
 .code
+
+; --------------------------------------------------
+; HOOK 1: SUIT DAMAGE DETOUR
+; --------------------------------------------------
 SuitDamageHookDetourAsm PROC
     ; 1. Save standard registers
     push rax
@@ -58,4 +66,18 @@ SuitDamageHookDetourAsm PROC
     jmp qword ptr [g_return_address]
 
 SuitDamageHookDetourAsm ENDP
+
+; --- 2. THE MASTER COORDINATE STEALER ---
+MasterCoordinateHookAsm PROC
+    ; 1. Steal RCX (The base pointer for the absolute global coordinates)
+    mov g_player_base, rcx
+    
+    ; 2. Execute the original 5-byte Z-coordinate write
+    ; vmovss [rcx+3Ch],xmm2
+    DB 0C5h, 0FAh, 011h, 051h, 03Ch
+    
+    ; 3. Jump back to the game seamlessly
+    jmp qword ptr [g_coord_return]
+MasterCoordinateHookAsm ENDP
+
 END
