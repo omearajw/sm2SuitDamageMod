@@ -30,4 +30,27 @@ namespace SuitDamageManager {
     void SetHealEnabled(bool enabled);
     void SetHealRate(int rate);
     void SetHealInterval(int interval);
+    bool IsWardrobeHealEnabled();
+    void SetWardrobeHealEnabled(bool enabled);
+    
+    bool IsSafehouseHealEnabled();
+    void SetSafehouseHealEnabled(bool enabled);
+    
+    bool IsFieldHealEnabled();
+    void SetFieldHealEnabled(bool enabled);
+
+    float GetSafehouseHealRate();
+    void SetSafehouseHealRate(float rate);
+
+    float GetFieldHealRate();
+    void SetFieldHealRate(float rate);
+
+    void ApplyFieldHeal(float delta_sec);
+    void ApplySafehouseHeal(float delta_sec);
+    
+    int GetRespawnBehavior();
+    void SetRespawnBehavior(int behavior);
+
+    void LoadSettingsFromINI();
+    void SaveSettingsToINI();
 }

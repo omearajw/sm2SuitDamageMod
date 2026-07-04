@@ -25,6 +25,22 @@ uintptr_t g_player_pointer = 0;
 uintptr_t g_hook_target = 0;
 bool g_hook_installed = false;
 
+extern int current_preset;
+
+// --- NEW FEATURE GLOBALS ---
+std::atomic<bool> g_wardrobe_heal_enabled{true};
+std::atomic<bool> g_safehouse_heal_enabled{true};
+std::atomic<bool> g_field_heal_enabled{true};
+
+// 0 = Vanilla (Heal), 1 = Cinematic (Maintain), 2 = Survivor (Destroyed)
+std::atomic<int> g_respawn_behavior{2}; 
+
+// Track time since last hit for Field Repair delay
+std::atomic<DWORD> g_last_damage_tick{0};
+
+std::atomic<float> g_safehouse_heal_rate{10.0f}; // 10% per second
+std::atomic<float> g_field_heal_rate{0.5f};      // 0.5% per second (very slow)
+
 std::atomic<bool> g_accumulate_damage{true}; 
 std::atomic<float> g_damage_multiplier{1.0f};
 float g_suit_value = 1.0f;
@@ -85,42 +101,43 @@ namespace {
     std::atomic<float> g_last_game_intended_value{1.0f};
     uintptr_t g_last_pointer = 0;
 
-    // --- THE LOGIC BRIDGE ---
     extern "C" float SuitDamageLogic(uintptr_t pointer, float game_intended_value) {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         
-        // 1. Did the memory pointer change? (e.g., Loaded a save or changed suits)
-        // We reset our trackers here so we don't accidentally apply massive damage on load.
+        // 1. POINTER SWAP (Fast Travel, Reload, or Respawn after Death)
         if (pointer != g_last_pointer) {
             g_last_pointer = pointer;
             g_player_pointer = pointer; 
+            
+            // Apply the custom respawn penalty
+            int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+            if (respawn_mode == 0) { // VANILLA
+                g_suit_value = 1.0f;
+            } else if (respawn_mode == 1) { // CINEMATIC
+                // Do nothing, maintain current damage
+            } else if (respawn_mode == 2) { // SURVIVOR
+                g_suit_value = 0.0f; // Completely destroyed
+            }
+
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
         
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
-            
             float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
             
-            // 2. We ONLY take damage if the game's internal math drops compared to ITS OWN previous state.
             if (game_intended_value < last_val) {
-                
-                // Calculate the exact delta (how hard the punch was)
+                // THE PLAYER TOOK DAMAGE - Reset the field heal timer!
+                g_last_damage_tick.store(GetTickCount(), std::memory_order_relaxed);
+
                 float damage_taken = last_val - game_intended_value;
-                
-                // Apply the multiplier from your UI menu
                 float mult = g_damage_multiplier.load(std::memory_order_relaxed);
-                float final_damage = damage_taken * mult;
+                float final_damage = (damage_taken * 0.20f) * mult; // 0.20f Base Scalar
                 
-                // Damage our fully independent suit value
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
-            
-            // 3. Always sync our tracker to the game's current internal state
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
-            
         } else {
-            // Standard passthrough if the mod is turned off
             g_suit_value = game_intended_value; 
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
@@ -346,17 +363,27 @@ namespace {
     void SetHealRateInternal(int rate) { g_heal_rate.store(std::clamp(rate, kMinRate, kMaxRate), std::memory_order_relaxed); }
     void SetHealIntervalInternal(int interval) { g_heal_interval.store(std::clamp(interval, kMinInterval, kMaxInterval), std::memory_order_relaxed); }
 
-    void ApplyHeal() {
-        if (!g_heal_enabled.load(std::memory_order_relaxed)) return;
-        int rate = g_heal_rate.load(std::memory_order_relaxed);
-        if (rate <= 0) return;
+    void ApplyFieldHeal(float delta_sec) {
+        if (!g_field_heal_enabled.load(std::memory_order_relaxed)) return;
+        float rate = g_field_heal_rate.load(std::memory_order_relaxed);
+        if (rate <= 0.0f) return;
 
         float current_fraction = GetCurrentSuitFraction();
-        
-        // REVERSED LOGIC: Add the rate instead of subtracting
-        float new_fraction = current_fraction + (rate / 1000.0f);
-        if (new_fraction > 1.0f) new_fraction = 1.0f; // Clamp to max health
+        // Multiply the rate by the exact fraction of a second that has passed
+        float new_fraction = current_fraction + ((rate / 100.0f) * delta_sec);
+        if (new_fraction > 1.0f) new_fraction = 1.0f; 
+        SetSuitFraction(new_fraction);
+    }
 
+    void ApplySafehouseHeal(float delta_sec) {
+        if (!g_safehouse_heal_enabled.load(std::memory_order_relaxed)) return;
+        float rate = g_safehouse_heal_rate.load(std::memory_order_relaxed);
+        if (rate <= 0.0f) return;
+
+        float current_fraction = GetCurrentSuitFraction();
+        // Multiply the rate by the exact fraction of a second that has passed
+        float new_fraction = current_fraction + ((rate / 100.0f) * delta_sec);
+        if (new_fraction > 1.0f) new_fraction = 1.0f; 
         SetSuitFraction(new_fraction);
     }
 
@@ -374,23 +401,59 @@ namespace {
         uintptr_t suit_id_pointer = base_address + 0xAFB6EE8;
 
         DWORD last_tick = GetTickCount();
-        DWORD last_log_tick = 0; 
+        DWORD last_log_tick = 0;
+        DWORD last_heal_tick = last_tick;
+        DWORD last_decay_tick = last_tick;
 
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
+            DWORD now = GetTickCount();
 
-            // --- 1. THE WARDROBE CLEANSE ---
+            // --- 1. WARDROBE CLEANSE ---
             if (base_address != 0) {
                 uint32_t current_suit_id = *reinterpret_cast<uint32_t*>(suit_id_pointer);
                 if (current_suit_id != g_last_suit_id.load(std::memory_order_relaxed)) {
                     if (g_last_suit_id.load(std::memory_order_relaxed) != 0) {
-                        LogHookStatus("Suit change detected! Wardrobe Cleanse applied.");
+                        if (g_wardrobe_heal_enabled.load(std::memory_order_relaxed)) {
+                            SuitDamageManager::SetSuitHealthFraction(1.0f);
+                            LogHookStatus("Suit changed: Wardrobe Cleanse applied.");
+                        }
                     }
                     g_last_suit_id.store(current_suit_id, std::memory_order_relaxed);
                 }
             }
 
-            // Inside WorkerThread()...
+            // --- 2. DECAY ENGINE ---
+            if (g_decay_enabled.load(std::memory_order_relaxed)) {
+                if (now - last_decay_tick >= g_decay_interval.load(std::memory_order_relaxed)) {
+                    ApplyDecay();
+                    last_decay_tick = now;
+                }
+            }
+
+            // --- 3. HEAL ENGINE (Safehouse vs Field) ---
+            // Calculate exactly how many seconds have passed since the last loop (approx 0.016s)
+            float delta_sec = (now - last_tick) / 1000.0f;
+            last_tick = now;
+
+            // --- 3. HEAL ENGINE (Safehouse vs Field) ---
+            bool in_safehouse = false;
+            HeroSystem* hero_sys = GetHeroSystem();
+            if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
+                in_safehouse = IsInPetersHouse(hero_sys->GetHero()->GetPosition());
+            }
+
+            if (in_safehouse && g_safehouse_heal_enabled.load(std::memory_order_relaxed)) {
+                // Pass the delta time straight into the math
+                ApplySafehouseHeal(delta_sec); 
+            } 
+            else if (g_field_heal_enabled.load(std::memory_order_relaxed)) {
+                if (now - g_last_damage_tick.load(std::memory_order_relaxed) > 30000) {
+                    // Pass the delta time straight into the math
+                    ApplyFieldHeal(delta_sec);
+                }
+            }
+
             if (GetAsyncKeyState(VK_F9) & 0x8000) {
                 DWORD now = GetTickCount();
                 if (now - last_log_tick > 1000) { 
@@ -422,27 +485,68 @@ namespace {
                     last_log_tick = now;
                 }
             }
-            HeroSystem* hero_sys = GetHeroSystem();
-            if (hero_sys != nullptr) {
-                Actor* peter = hero_sys->GetHero();
-                if (peter != nullptr) {
-                    Vector3 pos = peter->GetPosition();
+            Sleep(16); 
+        } // <--- THIS BRACE CLOSES THE WHILE LOOP
 
-                    if (IsInPetersHouse(pos)) {
-                        // Turn ON the gradual heal while inside
-                        SuitDamageManager::SetHealEnabled(true);
-                    } else {
-                        // Turn OFF the gradual heal the moment he steps outside
-                        SuitDamageManager::SetHealEnabled(false);
-                    }
-                }
-            }
+        // This log only fires ONCE when the game actually closes now!
         LogHookStatus("WorkerThread shutting down.");
     }
 }
 
+const char* kConfigPath = ".\\SuitDamageConfig.ini";
+
 namespace SuitDamageManager {
     bool g_we_initialized_minhook = false;
+
+    void SaveSettingsToINI() {
+        auto WriteFloat = [](const char* key, float val) {
+            char buf[32]; snprintf(buf, sizeof(buf), "%.2f", val);
+            WritePrivateProfileStringA("Settings", key, buf, kConfigPath);
+        };
+        auto WriteInt = [](const char* key, int val) {
+            char buf[32]; snprintf(buf, sizeof(buf), "%d", val);
+            WritePrivateProfileStringA("Settings", key, buf, kConfigPath);
+        };
+
+        WriteInt("ActivePreset", current_preset);
+        WriteFloat("DamageMultiplier", g_damage_multiplier.load(std::memory_order_relaxed));
+        WriteInt("DecayEnabled", g_decay_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        WriteInt("DecayRate", g_decay_rate.load(std::memory_order_relaxed));
+        WriteInt("HealEnabled", g_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        WriteInt("HealRate", g_heal_rate.load(std::memory_order_relaxed));
+        WriteInt("SafehouseHealRate", g_safehouse_heal_rate.load(std::memory_order_relaxed));
+        WriteInt("FieldHealRate", g_field_heal_rate.load(std::memory_order_relaxed));
+        
+        // --- NEW SAVES ---
+        WriteInt("WardrobeHeal", g_wardrobe_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        WriteInt("SafehouseHeal", g_safehouse_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        WriteInt("FieldHeal", g_field_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
+        WriteInt("RespawnBehavior", g_respawn_behavior.load(std::memory_order_relaxed));
+    }
+
+    void LoadSettingsFromINI() {
+        auto ReadFloat = [](const char* key, float default_val) -> float {
+            char buf[32];
+            GetPrivateProfileStringA("Settings", key, "", buf, sizeof(buf), kConfigPath);
+            if (buf[0] == '\0') return default_val;
+            try { return std::stof(buf); } catch (...) { return default_val; }
+        };
+
+        current_preset = GetPrivateProfileIntA("Settings", "ActivePreset", 2, kConfigPath);
+        g_damage_multiplier.store(ReadFloat("DamageMultiplier", 2.0f), std::memory_order_relaxed);
+        g_decay_enabled.store(GetPrivateProfileIntA("Settings", "DecayEnabled", 0, kConfigPath) != 0, std::memory_order_relaxed);
+        g_decay_rate.store(GetPrivateProfileIntA("Settings", "DecayRate", 10, kConfigPath), std::memory_order_relaxed);
+        g_heal_enabled.store(GetPrivateProfileIntA("Settings", "HealEnabled", 0, kConfigPath) != 0, std::memory_order_relaxed);
+        g_heal_rate.store(GetPrivateProfileIntA("Settings", "HealRate", 5, kConfigPath), std::memory_order_relaxed);
+        
+        // --- NEW LOADS ---
+        g_wardrobe_heal_enabled.store(GetPrivateProfileIntA("Settings", "WardrobeHeal", 1, kConfigPath) != 0, std::memory_order_relaxed);
+        g_safehouse_heal_enabled.store(GetPrivateProfileIntA("Settings", "SafehouseHeal", 1, kConfigPath) != 0, std::memory_order_relaxed);
+        g_field_heal_enabled.store(GetPrivateProfileIntA("Settings", "FieldHeal", 1, kConfigPath) != 0, std::memory_order_relaxed);
+        g_respawn_behavior.store(GetPrivateProfileIntA("Settings", "RespawnBehavior", 2, kConfigPath), std::memory_order_relaxed);
+        
+        LogHookStatus("SUCCESS: Settings loaded from SuitDamageConfig.ini");
+    }
 
     void Init() {
         LogHookStatus("========================================");
@@ -462,6 +566,7 @@ namespace SuitDamageManager {
         }
 
         g_running.store(true, std::memory_order_relaxed);
+        LoadSettingsFromINI();
         g_worker = std::thread(WorkerThread);
     }
 
@@ -508,4 +613,21 @@ namespace SuitDamageManager {
     void SetHealEnabled(bool enabled) { g_heal_enabled.store(enabled, std::memory_order_relaxed); }
     void SetHealRate(int rate) { SetHealRateInternal(rate); }
     void SetHealInterval(int interval) { SetHealIntervalInternal(interval); }
+    bool IsWardrobeHealEnabled() { return g_wardrobe_heal_enabled.load(std::memory_order_relaxed); }
+    void SetWardrobeHealEnabled(bool enabled) { g_wardrobe_heal_enabled.store(enabled, std::memory_order_relaxed); }
+
+    bool IsSafehouseHealEnabled() { return g_safehouse_heal_enabled.load(std::memory_order_relaxed); }
+    void SetSafehouseHealEnabled(bool enabled) { g_safehouse_heal_enabled.store(enabled, std::memory_order_relaxed); }
+
+    bool IsFieldHealEnabled() { return g_field_heal_enabled.load(std::memory_order_relaxed); }
+    void SetFieldHealEnabled(bool enabled) { g_field_heal_enabled.store(enabled, std::memory_order_relaxed); }
+
+    int GetRespawnBehavior() { return g_respawn_behavior.load(std::memory_order_relaxed); }
+    void SetRespawnBehavior(int behavior) { g_respawn_behavior.store(behavior, std::memory_order_relaxed); }
+
+    float GetSafehouseHealRate() { return g_safehouse_heal_rate.load(std::memory_order_relaxed); }
+    void SetSafehouseHealRate(float rate) { g_safehouse_heal_rate.store(rate, std::memory_order_relaxed); }
+    
+    float GetFieldHealRate() { return g_field_heal_rate.load(std::memory_order_relaxed); }
+    void SetFieldHealRate(float rate) { g_field_heal_rate.store(rate, std::memory_order_relaxed); }
 }
