@@ -51,6 +51,9 @@ namespace SuitDamageManager {
     int GetRespawnBehavior();
     void SetRespawnBehavior(int behavior);
 
+    void SetCurrentLocationAsSafehouse();
+    void ClearCustomSafehouse();
+
     void LoadSettingsFromINI();
     void SaveSettingsToINI();
 }

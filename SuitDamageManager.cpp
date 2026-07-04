@@ -41,6 +41,12 @@ std::atomic<DWORD> g_last_damage_tick{0};
 std::atomic<float> g_safehouse_heal_rate{10.0f}; // 10% per second
 std::atomic<float> g_field_heal_rate{0.5f};      // 0.5% per second (very slow)
 
+// --- MULTI-SAFEHOUSE GLOBALS ---
+std::atomic<float> g_custom_x{0.0f};
+std::atomic<float> g_custom_y{0.0f};
+std::atomic<float> g_custom_z{0.0f};
+std::atomic<float> g_custom_radius{0.0f}; // 0.0f means no custom safehouse is set yet
+
 std::atomic<bool> g_accumulate_damage{true}; 
 std::atomic<float> g_damage_multiplier{1.0f};
 float g_suit_value = 1.0f;
@@ -303,12 +309,31 @@ namespace {
         }
     }
 
-    bool IsInPetersHouse(Vector3 pos) {
-        bool insideX = (pos.x >= 2574.5f && pos.x <= 2611.5f);
-        bool insideY = (pos.y >= 1.0f && pos.y <= 14.5f); // Floor lowered
-        bool insideZ = (pos.z >= -908.0f && pos.z <= -885.0f);
+    bool IsInSafehouse(Vector3 pos) {
+        // 1. PETER'S HOUSE (Hardcoded)
+        bool inPeter = (pos.x >= 2574.5f && pos.x <= 2611.5f) &&
+                       (pos.y >= 1.0f && pos.y <= 14.5f) &&
+                       (pos.z >= -908.0f && pos.z <= -885.0f);
 
-        return (insideX && insideY && insideZ);
+        // 2. MILES' APARTMENT
+        bool inMiles = (pos.x >= 226.5f && pos.x <= 244.0f) &&
+                       (pos.y >= 8.0f && pos.y <= 29.5f) &&
+                       (pos.z >= -2149.0f && pos.z <= -2122.5f);
+
+        // 3. CUSTOM SAFEHOUSE (Dynamic)
+        bool inCustom = false;
+        float radius = g_custom_radius.load(std::memory_order_relaxed);
+        if (radius > 0.0f) { 
+            float cx = g_custom_x.load(std::memory_order_relaxed);
+            float cy = g_custom_y.load(std::memory_order_relaxed);
+            float cz = g_custom_z.load(std::memory_order_relaxed);
+            
+            inCustom = (pos.x >= cx - radius && pos.x <= cx + radius) &&
+                       (pos.y >= cy - radius && pos.y <= cy + radius) &&
+                       (pos.z >= cz - radius && pos.z <= cz + radius);
+        }
+
+        return (inPeter || inMiles || inCustom);
     }
 
     void RepairSuitInternal() { SetSuitFraction(1.0f); }
@@ -440,7 +465,7 @@ namespace {
             bool in_safehouse = false;
             HeroSystem* hero_sys = GetHeroSystem();
             if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
-                in_safehouse = IsInPetersHouse(hero_sys->GetHero()->GetPosition());
+                in_safehouse = IsInSafehouse(hero_sys->GetHero()->GetPosition());
             }
 
             if (in_safehouse && g_safehouse_heal_enabled.load(std::memory_order_relaxed)) {
@@ -522,6 +547,11 @@ namespace SuitDamageManager {
         WriteInt("SafehouseHeal", g_safehouse_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
         WriteInt("FieldHeal", g_field_heal_enabled.load(std::memory_order_relaxed) ? 1 : 0);
         WriteInt("RespawnBehavior", g_respawn_behavior.load(std::memory_order_relaxed));
+
+        WriteFloat("CustomX", g_custom_x.load(std::memory_order_relaxed));
+        WriteFloat("CustomY", g_custom_y.load(std::memory_order_relaxed));
+        WriteFloat("CustomZ", g_custom_z.load(std::memory_order_relaxed));
+        WriteFloat("CustomRadius", g_custom_radius.load(std::memory_order_relaxed));
     }
 
     void LoadSettingsFromINI() {
@@ -544,8 +574,35 @@ namespace SuitDamageManager {
         g_safehouse_heal_enabled.store(GetPrivateProfileIntA("Settings", "SafehouseHeal", 1, kConfigPath) != 0, std::memory_order_relaxed);
         g_field_heal_enabled.store(GetPrivateProfileIntA("Settings", "FieldHeal", 1, kConfigPath) != 0, std::memory_order_relaxed);
         g_respawn_behavior.store(GetPrivateProfileIntA("Settings", "RespawnBehavior", 2, kConfigPath), std::memory_order_relaxed);
+
+        g_custom_x.store(ReadFloat("CustomX", 0.0f), std::memory_order_relaxed);
+        g_custom_y.store(ReadFloat("CustomY", 0.0f), std::memory_order_relaxed);
+        g_custom_z.store(ReadFloat("CustomZ", 0.0f), std::memory_order_relaxed);
+        g_custom_radius.store(ReadFloat("CustomRadius", 0.0f), std::memory_order_relaxed);
         
         LogHookStatus("SUCCESS: Settings loaded from SuitDamageConfig.ini");
+    }
+
+    // --- PASTE THE CUT FUNCTIONS HERE ---
+    void SetCurrentLocationAsSafehouse() {
+        HeroSystem* hero_sys = GetHeroSystem();
+        if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
+            Vector3 pos = hero_sys->GetHero()->GetPosition();
+            
+            g_custom_x.store(pos.x, std::memory_order_relaxed);
+            g_custom_y.store(pos.y, std::memory_order_relaxed);
+            g_custom_z.store(pos.z, std::memory_order_relaxed);
+            g_custom_radius.store(25.0f, std::memory_order_relaxed); 
+            
+            SaveSettingsToINI(); 
+            LogHookStatus("SUCCESS: Custom safehouse coordinates locked in.");
+        }
+    }
+
+    void ClearCustomSafehouse() {
+        g_custom_radius.store(0.0f, std::memory_order_relaxed);
+        SaveSettingsToINI();
+        LogHookStatus("SUCCESS: Custom safehouse cleared.");
     }
 
     void Init() {

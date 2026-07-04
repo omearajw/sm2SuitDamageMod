@@ -155,6 +155,16 @@ void HealthMenu::Create() {
 
     Dropdown<AdvancedMenu>();
 
+    Header("LOCATION MAPPING");
+        
+        Button("SET CURRENT LOCATION AS SAFEHOUSE", "Creates a persistent repair zone exactly where you are currently standing.", [](){
+            SuitDamageManager::SetCurrentLocationAsSafehouse();
+        });
+        
+        Button("CLEAR CUSTOM SAFEHOUSE", "Removes your custom repair zone. Peter and Miles' homes remain active.", [](){
+            SuitDamageManager::ClearCustomSafehouse();
+        });
+
     Header("MANUAL OVERRIDES");
 
     static float suit_percent;
