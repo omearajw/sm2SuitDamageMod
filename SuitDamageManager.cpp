@@ -56,6 +56,9 @@ std::atomic<bool> g_show_debug_overlay{false};
 HANDLE g_console_handle = nullptr;
 bool g_console_allocated = false;
 
+Vector3 g_last_position{0.0f, 0.0f, 0.0f};
+bool g_has_last_position = false;
+
 extern "C" {
     uintptr_t g_player_base = 0;
     uintptr_t g_coord_return = 0;
@@ -394,14 +397,47 @@ namespace {
         }
     }
 
-    void ApplyDecay() {
+    void ApplyDecay(Vector3 current_pos, float delta_sec) {
         if (!g_decay_enabled.load(std::memory_order_relaxed)) return;
-        int rate = g_decay_rate.load(std::memory_order_relaxed);
-        if (rate <= 0) return;
+        if (delta_sec <= 0.0f) return;
+
+        // Initialize position on your very first frame
+        if (!g_has_last_position) {
+            g_last_position = current_pos;
+            g_has_last_position = true;
+            return;
+        }
+
+        // 1. Calculate the 3D distance moved since last frame
+        float dx = current_pos.x - g_last_position.x;
+        float dy = current_pos.y - g_last_position.y;
+        float dz = current_pos.z - g_last_position.z;
+        float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        // Store the current position for the next frame's math
+        g_last_position = current_pos;
+
+        // 2. TELEPORT DETECTION: If he moves > 150 units in ~16ms, he fast-travelled or respawned.
+        if (distance > 150.0f) {
+            LogHookStatus("Teleport detected. Skipping physics decay.");
+            return; 
+        }
+
+        // 3. Calculate current velocity (Units per second)
+        float current_speed = distance / delta_sec;
+
+        // 4. Threshold tuning: Ignore walking/crouching speeds (e.g., slower than 5 units/sec)
+        if (current_speed < 5.0f) return;
+
+        // 5. Apply the wear and tear scaled by speed and the mod menu multiplier
+        int user_multiplier = g_decay_rate.load(std::memory_order_relaxed); // From your menu slider
+        
+        // Base scalar scales the decay into an immersive rate
+        float base_decay_scalar = 0.000005f; 
+        float final_decay = current_speed * base_decay_scalar * user_multiplier * delta_sec;
 
         float current_fraction = GetCurrentSuitFraction();
-        // Divided by an extra 100 to drastically slow down the wear and tear
-        float new_fraction = current_fraction - (rate / 100000.0f); 
+        float new_fraction = current_fraction - final_decay;
         if (new_fraction < 0.0f) new_fraction = 0.0f;
 
         SetSuitFraction(new_fraction);
@@ -560,33 +596,31 @@ namespace {
                 }
             }
 
-            // --- 2. DECAY ENGINE ---
-            if (g_decay_enabled.load(std::memory_order_relaxed)) {
-                if (now - last_decay_tick >= g_decay_interval.load(std::memory_order_relaxed)) {
-                    ApplyDecay();
-                    last_decay_tick = now;
-                }
-            }
-
-            // --- 3. HEAL ENGINE (Safehouse vs Field) ---
+            // --- 2. HEAL ENGINE (Safehouse vs Field) ---
             // Calculate exactly how many seconds have passed since the last loop (approx 0.016s)
             float delta_sec = (now - last_tick) / 1000.0f;
             last_tick = now;
 
-            // --- 3. HEAL ENGINE (Safehouse vs Field) ---
+            // --- 2. HEAL ENGINE (Safehouse vs Field) ---
             bool in_safehouse = false;
+            Vector3 current_player_pos{0.0f, 0.0f, 0.0f};
+            
             HeroSystem* hero_sys = GetHeroSystem();
             if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
-                in_safehouse = IsInSafehouse(hero_sys->GetHero()->GetPosition());
+                current_player_pos = hero_sys->GetHero()->GetPosition();
+                in_safehouse = IsInSafehouse(current_player_pos);
+            }
+
+            // Run the physics decay calculation frame-by-frame
+            if (g_decay_enabled.load(std::memory_order_relaxed) && current_player_pos.x != 0.0f) {
+                ApplyDecay(current_player_pos, delta_sec);
             }
 
             if (in_safehouse && g_safehouse_heal_enabled.load(std::memory_order_relaxed)) {
-                // Pass the delta time straight into the math
                 ApplySafehouseHeal(delta_sec); 
             } 
             else if (g_field_heal_enabled.load(std::memory_order_relaxed)) {
                 if (now - g_last_damage_tick.load(std::memory_order_relaxed) > 30000) {
-                    // Pass the delta time straight into the math
                     ApplyFieldHeal(delta_sec);
                 }
             }
