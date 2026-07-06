@@ -23,6 +23,7 @@ extern "C" uintptr_t g_return_address = 0;
 extern "C" void SuitDamageHookDetourAsm(); 
 uintptr_t g_player_pointer = 0; 
 uintptr_t g_hook_target = 0;
+std::atomic<DWORD> g_last_hook_tick{0};
 bool g_hook_installed = false;
 
 extern int current_preset;
@@ -50,6 +51,10 @@ std::atomic<float> g_custom_radius{0.0f}; // 0.0f means no custom safehouse is s
 std::atomic<bool> g_accumulate_damage{true}; 
 std::atomic<float> g_damage_multiplier{1.0f};
 float g_suit_value = 1.0f;
+
+std::atomic<bool> g_show_debug_overlay{false};
+HANDLE g_console_handle = nullptr;
+bool g_console_allocated = false;
 
 extern "C" {
     uintptr_t g_player_base = 0;
@@ -110,34 +115,47 @@ namespace {
     extern "C" float SuitDamageLogic(uintptr_t pointer, float game_intended_value) {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         
-        // 1. POINTER SWAP (Fast Travel, Reload, or Respawn after Death)
+        DWORD now = GetTickCount();
+        DWORD time_since_last = now - g_last_hook_tick.load(std::memory_order_relaxed);
+        g_last_hook_tick.store(now, std::memory_order_relaxed);
+
+        // A true respawn ALWAYS involves a loading screen. 
+        // If this hook hasn't fired in > 2.5 seconds, the game was loading.
+        bool was_loading_screen = (time_since_last > 2500);
+
         if (pointer != g_last_pointer) {
             g_last_pointer = pointer;
             g_player_pointer = pointer; 
             
-            // Apply the custom respawn penalty
-            int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
-            if (respawn_mode == 0) { // VANILLA
-                g_suit_value = 1.0f;
-            } else if (respawn_mode == 1) { // CINEMATIC
-                // Do nothing, maintain current damage
-            } else if (respawn_mode == 2) { // SURVIVOR
-                g_suit_value = 0.0f; // Completely destroyed
-            }
+            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
 
+            // --- TRUE RESPAWN DETECTOR ---
+            // Only punish the player if the pointer swapped, the game healed them, AND there was a loading screen.
+            // This completely ignores rapid cinematic QTEs like the car chase!
+            if (was_loading_screen && game_intended_value == 1.0f && last_val < 0.99f) {
+                int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+                
+                if (respawn_mode == 0) { // VANILLA
+                    g_suit_value = 1.0f; 
+                } else if (respawn_mode == 1) { // CINEMATIC
+                    // Maintain current damage
+                } else if (respawn_mode == 2) { // SURVIVOR
+                    g_suit_value = 0.0f; 
+                }
+            }
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
+            return g_suit_value;
         }
         
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
             float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
             
             if (game_intended_value < last_val) {
-                // THE PLAYER TOOK DAMAGE - Reset the field heal timer!
-                g_last_damage_tick.store(GetTickCount(), std::memory_order_relaxed);
+                g_last_damage_tick.store(now, std::memory_order_relaxed);
 
                 float damage_taken = last_val - game_intended_value;
                 float mult = g_damage_multiplier.load(std::memory_order_relaxed);
-                float final_damage = (damage_taken * 0.20f) * mult; // 0.20f Base Scalar
+                float final_damage = (damage_taken * 0.02f) * mult; 
                 
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
@@ -360,7 +378,10 @@ namespace {
                     case 0: break;
                     case 1: break;
                     case 2: break;
-                    case 3: break;
+                    case 3: 
+                        g_show_debug_overlay.store(!g_show_debug_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                        ShowNotification(g_show_debug_overlay.load() ? "Debug Overlay: ON" : "Debug Overlay: OFF");
+                        break;
                     case 4: SetSuitFraction(1.0f); ShowNotification("Suit: Full Health"); break;
                     case 5: SetSuitFraction(0.5f); ShowNotification("Suit: 50% Damaged"); break;
                     case 6: SetSuitFraction(0.1f); ShowNotification("Suit: Critical"); break;
@@ -379,7 +400,8 @@ namespace {
         if (rate <= 0) return;
 
         float current_fraction = GetCurrentSuitFraction();
-        float new_fraction = current_fraction - (rate / 1000.0f);
+        // Divided by an extra 100 to drastically slow down the wear and tear
+        float new_fraction = current_fraction - (rate / 100000.0f); 
         if (new_fraction < 0.0f) new_fraction = 0.0f;
 
         SetSuitFraction(new_fraction);
@@ -412,6 +434,87 @@ namespace {
         SetSuitFraction(new_fraction);
     }
 
+    std::string GetDebugOverlayText() {
+        if (!g_show_debug_overlay.load(std::memory_order_relaxed)) return "";
+
+        char buffer[1024];
+        
+        // Grab dynamic coordinate data safely
+        float p_x = 0.0f, p_y = 0.0f, p_z = 0.0f;
+        bool in_safehouse = false;
+        
+        HeroSystem* hero_sys = GetHeroSystem();
+        if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
+            Vector3 pos = hero_sys->GetHero()->GetPosition();
+            p_x = pos.x; p_y = pos.y; p_z = pos.z;
+            in_safehouse = IsInSafehouse(pos);
+        }
+
+        snprintf(buffer, sizeof(buffer),
+            "--- SUIT DAMAGE V2 DEBUG ---\n"
+            "Suit Health:   %.2f%%\n"
+            "Damage Mult:   %.2fx\n"
+            "Active Preset: %d\n"
+            "--- PLAYER STATE ---\n"
+            "Coords: X:%.1f Y:%.1f Z:%.1f\n"
+            "In Safehouse:  %s\n"
+            "--- ENGINE STATUS ---\n"
+            "Decay Active:  %s (Rate: %d)\n"
+            "Field Heal:    %s\n"
+            "Safehouse Rate:%.2f%% per sec\n"
+            "Respawn Mode:  %d",
+            GetCurrentSuitFraction() * 100.0f,
+            g_damage_multiplier.load(std::memory_order_relaxed),
+            current_preset,
+            p_x, p_y, p_z,
+            in_safehouse ? "TRUE" : "FALSE",
+            g_decay_enabled.load() ? "ON" : "OFF", g_decay_rate.load(),
+            g_field_heal_enabled.load() ? "ON" : "OFF",
+            g_safehouse_heal_rate.load(std::memory_order_relaxed),
+            g_respawn_behavior.load()
+        );
+
+        return std::string(buffer);
+    }
+
+    void UpdateDebugConsole() {
+        if (g_show_debug_overlay.load(std::memory_order_relaxed)) {
+            // Allocate the console if it doesn't exist yet
+            if (!g_console_allocated) {
+                AllocConsole();
+                SetConsoleTitleA("Suit Damage V2 - Live Debug");
+                g_console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                g_console_allocated = true;
+            }
+            
+            // Make sure the window is visible
+            HWND consoleWindow = GetConsoleWindow();
+            if (consoleWindow) ShowWindow(consoleWindow, SW_SHOW);
+
+            // Lock the cursor to the top-left so we overwrite the text instead of spam-scrolling
+            if (g_console_handle) {
+                COORD cursorPosition;
+                cursorPosition.X = 0;
+                cursorPosition.Y = 0;
+                SetConsoleCursorPosition(g_console_handle, cursorPosition);
+
+                std::string text = GetDebugOverlayText();
+                
+                // Pad the end with spaces to wipe any ghost characters from previous frames
+                text += "\n                                        \n                                        "; 
+                
+                DWORD written;
+                WriteConsoleA(g_console_handle, text.c_str(), static_cast<DWORD>(text.length()), &written, NULL);
+            }
+        } else {
+            // If the overlay is toggled off, hide the console window
+            if (g_console_allocated) {
+                HWND consoleWindow = GetConsoleWindow();
+                if (consoleWindow) ShowWindow(consoleWindow, SW_HIDE);
+            }
+        }
+    }
+
     void WorkerThread() {
         LogHookStatus("WorkerThread booted successfully.");
         if (kEnableInstructionPatch) {
@@ -432,7 +535,16 @@ namespace {
 
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
+            UpdateDebugConsole(); // <-- Renders the live overlay
             DWORD now = GetTickCount();
+
+            // --- ENGINE PAUSE DETECTOR ---
+            // If the engine hasn't called the hook in over 200ms, the game is paused.
+            if (now - g_last_hook_tick.load(std::memory_order_relaxed) > 200) {
+                last_tick = now; // Keep delta zeroed out so we don't get massive time jumps
+                Sleep(16);
+                continue; // Skip all healing, wardrobe, and decay math this frame
+            }
 
             // --- 1. WARDROBE CLEANSE ---
             if (base_address != 0) {

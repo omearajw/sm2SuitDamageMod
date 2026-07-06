@@ -2,7 +2,7 @@
     "name": "Consequences - A Suit Damage Overhaul",
     "type": "script",
     "author": "TallMonkee",
-    "version": "2.0.1",
+    "version": "2.0.2",
     "dependencies": ["ModSettings:1.0.4"],
 
     "game": "MSM2",
