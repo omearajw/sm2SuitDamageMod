@@ -18,13 +18,16 @@ public:
     void Create() override {
         Header("DAMAGE SETTINGS");
 
-        static float dmg_mult;
-        dmg_mult = SuitDamageManager::GetDamageMultiplier(); 
+        static float dmg_mult_int;
+        dmg_mult_int = static_cast<int>(SuitDamageManager::GetDamageMultiplier() * 10.0f); 
         SliderOpts mult_opts;
-        mult_opts.min = 5; mult_opts.max = 50; mult_opts.step = 5;
-        mult_opts.display_min = 5; mult_opts.display_max = 50;
-        Slider("DAMAGE MULTIPLIER", "Adjust damage rate. (10 = 1.0x)", &dmg_mult, mult_opts, [&](){
-            SuitDamageManager::SetDamageMultiplier(dmg_mult / 10.0f);
+        
+        // Min is now 0, allowing for a 0.0x damage multiplier
+        mult_opts.min = 0.0f; mult_opts.max = 50.0f; mult_opts.step = 5.0f;
+        mult_opts.display_min = 0.0f; mult_opts.display_max = 50.0f;
+        
+        Slider("DAMAGE MULTIPLIER", "Adjust damage rate. (10 = 1.0x, 0 = Maintain Suit)", &dmg_mult_int, mult_opts, [&](){
+            SuitDamageManager::SetDamageMultiplier(dmg_mult_int / 10.0f);
             current_preset = PRESET_CUSTOM; 
             SuitDamageManager::SaveSettingsToINI();
         });
@@ -39,13 +42,29 @@ public:
             SuitDamageManager::SaveSettingsToINI();
         });
 
-        static float f_heal_rate;
-        f_heal_rate = SuitDamageManager::GetFieldHealRate();
-        SliderOpts f_rate_opts;
-        f_rate_opts.min = 0.0f; f_rate_opts.max = 20.0f; f_rate_opts.step = 0.5f;
-        f_rate_opts.display_min = 0; f_rate_opts.display_max = 20;
-        Slider("FIELD HEAL RATE", "% of health restored per second in the field.", &f_heal_rate, f_rate_opts, [&](){
-            SuitDamageManager::SetFieldHealRate(f_heal_rate);
+        static int field_speed_idx = 2; // Default to Standard
+        float current_f_rate = SuitDamageManager::GetFieldHealRate();
+        
+        // Match the float to the UI index
+        if (current_f_rate >= 3.3f) field_speed_idx = 0;      // Arcade
+        else if (current_f_rate >= 1.6f) field_speed_idx = 1; // Fast
+        else if (current_f_rate >= 0.8f) field_speed_idx = 2; // Standard
+        else if (current_f_rate >= 0.5f) field_speed_idx = 3; // Slow
+        else field_speed_idx = 4;                             // Immersive
+
+        const char* f_speed_names[] = { "Arcade (30s)", "Fast (60s)", "Standard (~2 mins)", "Slow (~3 mins)", "Immersive (~5 mins)" };
+        Option("FIELD HEAL SPEED", "How quickly the suit auto-repairs while exploring.", &field_speed_idx, f_speed_names, 5, [&](){
+            
+            float new_f_rate = 0.83f; 
+            switch(field_speed_idx) {
+                case 0: new_f_rate = 3.33f; break; // Arcade
+                case 1: new_f_rate = 1.66f; break; // Fast
+                case 2: new_f_rate = 0.83f; break; // Standard
+                case 3: new_f_rate = 0.55f; break; // Slow
+                case 4: new_f_rate = 0.33f; break; // Immersive
+            }
+            
+            SuitDamageManager::SetFieldHealRate(new_f_rate);
             current_preset = PRESET_CUSTOM;
             SuitDamageManager::SaveSettingsToINI();
         });
@@ -60,24 +79,24 @@ public:
             SuitDamageManager::SaveSettingsToINI();
         });
 
-        static int safehouse_speed_idx = 2; // Default to Standard
+        static int safehouse_speed_idx = 1; // Default to Standard
         float current_rate = SuitDamageManager::GetSafehouseHealRate();
-        if (current_rate >= 20.0f) safehouse_speed_idx = 4;
-        else if (current_rate >= 10.0f) safehouse_speed_idx = 3;
-        else if (current_rate >= 3.0f) safehouse_speed_idx = 2;
-        else if (current_rate >= 1.5f) safehouse_speed_idx = 1;
-        else safehouse_speed_idx = 0;
+        
+        // Match the engine float to the 4 UI indices
+        if (current_rate >= 10.0f) safehouse_speed_idx = 0;      // Fast (10s)
+        else if (current_rate >= 3.3f) safehouse_speed_idx = 1;  // Standard (30s)
+        else if (current_rate >= 1.6f) safehouse_speed_idx = 2;  // Slow (60s)
+        else safehouse_speed_idx = 3;                            // Immersive (120s)
 
-        const char* speed_names[] = { "Immersive (~2 mins)", "Slow (~60s)", "Standard (~30s)", "Fast (10s)", "Arcade (5s)" };
-        Option("SAFEHOUSE HEAL SPEED", "How quickly the suit repairs at a safehouse.", &safehouse_speed_idx, speed_names, 5, [&](){
+        const char* speed_names[] = { "Fast (10s)", "Standard (~30s)", "Slow (~60s)", "Immersive (~2 mins)" };
+        Option("SAFEHOUSE HEAL SPEED", "How quickly the suit repairs at a safehouse.", &safehouse_speed_idx, speed_names, 4, [&](){
             
             float new_rate = 3.33f; 
             switch(safehouse_speed_idx) {
-                case 0: new_rate = 0.8f; break;  // 120 seconds
-                case 1: new_rate = 1.66f; break; // 60 seconds
-                case 2: new_rate = 3.33f; break; // 30 seconds
-                case 3: new_rate = 10.0f; break; // 10 seconds
-                case 4: new_rate = 20.0f; break; // 5 seconds
+                case 0: new_rate = 10.0f; break; // Fast (10s)
+                case 1: new_rate = 3.33f; break; // Standard (30s)
+                case 2: new_rate = 1.66f; break; // Slow (60s)
+                case 3: new_rate = 0.83f; break; // Immersive (120s)
             }
             
             SuitDamageManager::SetSafehouseHealRate(new_rate);
@@ -95,13 +114,14 @@ public:
             SuitDamageManager::SaveSettingsToINI();
         });
 
-        static float decay_rate;
-        decay_rate = static_cast<float>(SuitDamageManager::GetDecayRate());
-        SliderOpts d_rate_opts;
-        d_rate_opts.min = 0.0f; d_rate_opts.max = 100.0f; d_rate_opts.step = 1.0f;
-        d_rate_opts.display_min = 0; d_rate_opts.display_max = 100;
-        Slider("DECAY RATE", "Speed of natural wear and tear.", &decay_rate, d_rate_opts, [&](){
-            SuitDamageManager::SetDecayRate(static_cast<int>(decay_rate));
+        static float decay_rate_int = SuitDamageManager::GetDecayRate(); 
+        SliderOpts decay_opts;
+        
+        decay_opts.min = 0.0f; decay_opts.max = 50.0f; decay_opts.step = 5.0f;
+        decay_opts.display_min = 0.0f; decay_opts.display_max = 50.0f;
+        
+        Slider("DECAY MULTIPLIER", "Adjust swinging decay rate. (10 = 1.0x, 0 = Off)", &decay_rate_int, decay_opts, [&](){
+            SuitDamageManager::SetDecayRate(decay_rate_int/5.0f);
             current_preset = PRESET_CUSTOM;
             SuitDamageManager::SaveSettingsToINI();
         });
@@ -148,13 +168,13 @@ void HealthMenu::Create() {
         
         if (current_preset == PRESET_VANILLA_PLUS) {
             // Normal damage
-            SuitDamageManager::SetDamageMultiplier(1.0f);
+            SuitDamageManager::SetDamageMultiplier(1.5f);
             
             // Normal Out-of-Combat Healing
             SuitDamageManager::SetSafehouseHealEnabled(true);
-            SuitDamageManager::SetSafehouseHealRate(20.0f); 
+            SuitDamageManager::SetSafehouseHealRate(10.0f); 
             SuitDamageManager::SetFieldHealEnabled(true);
-            SuitDamageManager::SetFieldHealRate(5.0f); 
+            SuitDamageManager::SetFieldHealRate(3.33f); 
             
             SuitDamageManager::SetDecayEnabled(false);
             SuitDamageManager::SetWardrobeHealEnabled(true);
@@ -166,9 +186,9 @@ void HealthMenu::Create() {
             
             // Slower Out-of-Combat Healing
             SuitDamageManager::SetSafehouseHealEnabled(true);
-            SuitDamageManager::SetSafehouseHealRate(10.0f); 
+            SuitDamageManager::SetSafehouseHealRate(3.33f); 
             SuitDamageManager::SetFieldHealEnabled(true);
-            SuitDamageManager::SetFieldHealRate(1.0f); 
+            SuitDamageManager::SetFieldHealRate(0.8f); 
             
             SuitDamageManager::SetDecayEnabled(false);
             SuitDamageManager::SetWardrobeHealEnabled(true);
@@ -176,16 +196,16 @@ void HealthMenu::Create() {
         }
         else if (current_preset == PRESET_SURVIVOR) {
             // Lowest damage (attrition based)
-            SuitDamageManager::SetDamageMultiplier(0.5f);
+            SuitDamageManager::SetDamageMultiplier(1.0f);
             
             // No Out-of-Combat Healing
             SuitDamageManager::SetSafehouseHealEnabled(true);
-            SuitDamageManager::SetSafehouseHealRate(4.0f); 
+            SuitDamageManager::SetSafehouseHealRate(1.66f); 
             SuitDamageManager::SetFieldHealEnabled(false); 
             SuitDamageManager::SetFieldHealRate(0.0f); 
             
             SuitDamageManager::SetDecayEnabled(true);
-            SuitDamageManager::SetDecayRate(1); 
+            SuitDamageManager::SetDecayRate(10.0f); 
             SuitDamageManager::SetWardrobeHealEnabled(false);
             SuitDamageManager::SetRespawnBehavior(2); // Suit Destroyed
         }
@@ -202,7 +222,7 @@ void HealthMenu::Create() {
     suit_percent = SuitDamageManager::GetSuitHealthPercent();
     SliderOpts percent_opts;
     percent_opts.min = 0.0f; percent_opts.max = 100.0f; percent_opts.step = 1.0f;
-    percent_opts.display_min = 0; percent_opts.display_max = 100;
+    percent_opts.display_min = 0.0f; percent_opts.display_max = 100.0f;
     Slider("SUIT PERCENT", "Manually set the suit's current health percentage.", &suit_percent, percent_opts, [&](){
         SuitDamageManager::SetSuitHealthPercent(suit_percent);
     });

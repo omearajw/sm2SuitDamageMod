@@ -17,6 +17,7 @@
 #include <mutex>
 #include <algorithm>
 #include <string>
+#include <deque>
 
 // --- GLOBALS MOVED OUT OF NAMESPACE TO FIX LINKER ERRORS ---
 extern "C" uintptr_t g_return_address = 0;
@@ -25,6 +26,11 @@ uintptr_t g_player_pointer = 0;
 uintptr_t g_hook_target = 0;
 std::atomic<DWORD> g_last_hook_tick{0};
 bool g_hook_installed = false;
+
+// --- ANALYTICS GLOBALS ---
+std::mutex g_analytics_mutex;
+std::deque<std::pair<DWORD, float>> g_suit_history;
+std::atomic<float> g_player_speed{0.0f};
 
 extern int current_preset;
 
@@ -158,7 +164,7 @@ namespace {
 
                 float damage_taken = last_val - game_intended_value;
                 float mult = g_damage_multiplier.load(std::memory_order_relaxed);
-                float final_damage = (damage_taken * 0.02f) * mult; 
+                float final_damage = (damage_taken * 0.12f) * mult; 
                 
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
@@ -374,16 +380,25 @@ namespace {
     void ShowNotification(const char* message) { INFO("%s", message); }
 
     void HandleHotkeys() {
+        // --- SECRET MODIFIER GATE ---
+        // Requires holding Left Ctrl (VK_LCONTROL), Left Shift (VK_LSHIFT), and Alt (VK_MENU)
+        bool modifiers_held = IsKeyDown(VK_LCONTROL) && IsKeyDown(VK_LSHIFT) && IsKeyDown(VK_MENU);
+        
         for (int index = 0; index < kNumHotkeys; ++index) {
             bool down = IsKeyDown(kHotkeyVks[index]);
+            
+            // Trigger the hotkey action if the button was just pressed
             if (down && !g_last_key_state[index]) {
                 switch (index) {
                     case 0: break;
                     case 1: break;
                     case 2: break;
                     case 3: 
-                        g_show_debug_overlay.store(!g_show_debug_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                        ShowNotification(g_show_debug_overlay.load() ? "Debug Overlay: ON" : "Debug Overlay: OFF");
+                        // F4 (Index 3) specifically requires the secret modifiers to be held down
+                        if (modifiers_held) {
+                            g_show_debug_overlay.store(!g_show_debug_overlay.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                            ShowNotification(g_show_debug_overlay.load() ? "Debug Overlay: ON" : "Debug Overlay: OFF");
+                        }
                         break;
                     case 4: SetSuitFraction(1.0f); ShowNotification("Suit: Full Health"); break;
                     case 5: SetSuitFraction(0.5f); ShowNotification("Suit: 50% Damaged"); break;
@@ -414,27 +429,30 @@ namespace {
         float dz = current_pos.z - g_last_position.z;
         float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-        // Store the current position for the next frame's math
         g_last_position = current_pos;
 
-        // 2. TELEPORT DETECTION: If he moves > 150 units in ~16ms, he fast-travelled or respawned.
+        // 2. TELEPORT DETECTION: > 150 units in ~16ms is a fast-travel/respawn.
         if (distance > 150.0f) {
-            LogHookStatus("Teleport detected. Skipping physics decay.");
             return; 
         }
 
-        // 3. Calculate current velocity (Units per second)
+        // 3. Calculate current velocity
         float current_speed = distance / delta_sec;
 
-        // 4. Threshold tuning: Ignore walking/crouching speeds (e.g., slower than 5 units/sec)
-        if (current_speed < 5.0f) return;
+        // --- DEBUG UI FLICKER FIX ---
+        // Blend 10% of the new speed with 90% of the old speed to smooth the readout
+        float old_speed = g_player_speed.load(std::memory_order_relaxed);
+        g_player_speed.store((old_speed * 0.9f) + (current_speed * 0.1f), std::memory_order_relaxed);
 
-        // 5. Apply the wear and tear scaled by speed and the mod menu multiplier
-        int user_multiplier = g_decay_rate.load(std::memory_order_relaxed); // From your menu slider
+        // 4. EXPONENTIAL DECAY MATH
+        // Square the velocity so walking/jogging produces virtually zero damage
+        float speed_squared = current_speed * current_speed;
         
-        // Base scalar scales the decay into an immersive rate
-        float base_decay_scalar = 0.000005f; 
-        float final_decay = current_speed * base_decay_scalar * user_multiplier * delta_sec;
+        int user_multiplier = g_decay_rate.load(std::memory_order_relaxed);
+        
+        // Base scalar lowered significantly to account for the massive squared speed values
+        float base_decay_scalar = 0.00000005f; 
+        float final_decay = speed_squared * base_decay_scalar * user_multiplier * delta_sec;
 
         float current_fraction = GetCurrentSuitFraction();
         float new_fraction = current_fraction - final_decay;
@@ -473,9 +491,68 @@ namespace {
     std::string GetDebugOverlayText() {
         if (!g_show_debug_overlay.load(std::memory_order_relaxed)) return "";
 
-        char buffer[1024];
+        DWORD now = GetTickCount();
+        float current_fraction = GetCurrentSuitFraction();
+
+        // --- 1. PROCESS ANALYTICS ---
+        float val_5s_ago = current_fraction;
+        float val_30s_ago = current_fraction;
+        float max_spike_5s = 0.0f;
+        float max_spike_30s = 0.0f;
         
-        // Grab dynamic coordinate data safely
+        {
+            std::lock_guard<std::mutex> lock(g_analytics_mutex);
+            bool found_5s = false;
+            float prev_val = -1.0f;
+            
+            for (const auto& sample : g_suit_history) {
+                // Pinpoint the exact health we had 5 seconds ago
+                if (!found_5s && (now - sample.first <= 5000)) {
+                    val_5s_ago = sample.second;
+                    found_5s = true;
+                }
+                
+                // Track max instantaneous damage spikes (e.g., getting hit by a rocket)
+                if (prev_val >= 0.0f) {
+                    float drop = prev_val - sample.second;
+                    if (drop > 0.0f) {
+                        max_spike_30s = (std::max)(max_spike_30s, drop);
+                        if (now - sample.first <= 5000) {
+                            max_spike_5s = (std::max)(max_spike_5s, drop);
+                        }
+                    }
+                }
+                prev_val = sample.second;
+            }
+            if (!g_suit_history.empty()) {
+                val_30s_ago = g_suit_history.front().second; // Oldest entry (up to 30s)
+            }
+        }
+
+        // --- 2. CALCULATE RATES ---
+        float loss_5s = (std::max)(0.0f, val_5s_ago - current_fraction);
+        float loss_30s = (std::max)(0.0f, val_30s_ago - current_fraction);
+        
+        float rate_5s = loss_5s / 5.0f;   // % lost per second (Short term)
+        float rate_30s = loss_30s / 30.0f; // % lost per second (Long term)
+
+        char etd_buffer[64];
+        if (rate_5s > 0.0001f) {
+            float seconds_left = current_fraction / rate_5s;
+            if (seconds_left > 3600.0f) snprintf(etd_buffer, sizeof(etd_buffer), "> 1 Hour");
+            else snprintf(etd_buffer, sizeof(etd_buffer), "%.1f seconds", seconds_left);
+        } else {
+            snprintf(etd_buffer, sizeof(etd_buffer), "Stable / Healing");
+        }
+
+        // --- 3. AUTO-HEAL COUNTDOWN ---
+        DWORD last_dmg = g_last_damage_tick.load(std::memory_order_relaxed);
+        float field_heal_timer = 0.0f;
+        if (now - last_dmg < 30000) {
+            field_heal_timer = 30.0f - ((now - last_dmg) / 1000.0f);
+        }
+
+        // --- 4. GATHER PLAYER STATE ---
         float p_x = 0.0f, p_y = 0.0f, p_z = 0.0f;
         bool in_safehouse = false;
         
@@ -486,28 +563,35 @@ namespace {
             in_safehouse = IsInSafehouse(pos);
         }
 
+        // --- 5. FORMAT OUTPUT ---
+        char buffer[1024];
         snprintf(buffer, sizeof(buffer),
-            "--- SUIT DAMAGE V2 DEBUG ---\n"
-            "Suit Health:   %.2f%%\n"
-            "Damage Mult:   %.2fx\n"
-            "Active Preset: %d\n"
-            "--- PLAYER STATE ---\n"
+            "--- SUIT DAMAGE V3 PERFORMANCE DEBUG ---\n"
+            "Suit Health:       %.2f%%\n"
+            "Active Preset:     %d (Dmg Mult: %.2fx)\n"
+            "Player Velocity:   %.1f units/sec\n"
+            "Auto-Heal CD:      %.1f sec remaining\n"
+            "----------------------------------------\n"
+            "--- LIVE ATTRITION ANALYTICS ---\n"
+            "5-Sec Avg Loss:    -%.2f%% per sec\n"
+            "30-Sec Avg Loss:   -%.2f%% per sec\n"
+            "Max Hit (5s):      -%.2f%%\n"
+            "Max Hit (30s):     -%.2f%%\n"
+            "Est. Time to 0%%:   %s\n"
+            "----------------------------------------\n"
             "Coords: X:%.1f Y:%.1f Z:%.1f\n"
-            "In Safehouse:  %s\n"
-            "--- ENGINE STATUS ---\n"
-            "Decay Active:  %s (Rate: %d)\n"
-            "Field Heal:    %s\n"
-            "Safehouse Rate:%.2f%% per sec\n"
-            "Respawn Mode:  %d",
-            GetCurrentSuitFraction() * 100.0f,
-            g_damage_multiplier.load(std::memory_order_relaxed),
-            current_preset,
+            "Safehouse Status:  %s",
+            current_fraction * 100.0f,
+            current_preset, g_damage_multiplier.load(std::memory_order_relaxed),
+            g_player_speed.load(std::memory_order_relaxed),
+            (std::max)(0.0f, field_heal_timer),
+            rate_5s * 100.0f,
+            rate_30s * 100.0f,
+            max_spike_5s * 100.0f,
+            max_spike_30s * 100.0f,
+            etd_buffer,
             p_x, p_y, p_z,
-            in_safehouse ? "TRUE" : "FALSE",
-            g_decay_enabled.load() ? "ON" : "OFF", g_decay_rate.load(),
-            g_field_heal_enabled.load() ? "ON" : "OFF",
-            g_safehouse_heal_rate.load(std::memory_order_relaxed),
-            g_respawn_behavior.load()
+            in_safehouse ? "ACTIVE" : "INACTIVE"
         );
 
         return std::string(buffer);
@@ -573,6 +657,17 @@ namespace {
             HandleHotkeys();
             UpdateDebugConsole(); // <-- Renders the live overlay
             DWORD now = GetTickCount();
+
+            // --- ANALYTICS RECORDER ---
+            {
+                std::lock_guard<std::mutex> lock(g_analytics_mutex);
+                g_suit_history.push_back({now, GetCurrentSuitFraction()});
+                
+                // Erase any data older than 30 seconds
+                while (!g_suit_history.empty() && (now - g_suit_history.front().first > 30000)) {
+                    g_suit_history.pop_front();
+                }
+            }
 
             // --- ENGINE PAUSE DETECTOR ---
             // If the engine hasn't called the hook in over 200ms, the game is paused.
