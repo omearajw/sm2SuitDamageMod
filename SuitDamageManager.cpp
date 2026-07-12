@@ -71,6 +71,32 @@ extern "C" {
     void MasterCoordinateHookAsm();
 }
 
+// --- CHARACTER PERSISTENCE ---
+// Index 0: Peter | Index 1: Miles | Index 2: Venom
+std::atomic<float> g_character_health[3] = {1.0f, 1.0f, 1.0f}; 
+std::atomic<int> g_active_character{0}; 
+
+// Reads the Active Character ID directly from the game's static memory
+int GetActiveCharacterId() {
+    // Cache the base address so we only have to look it up once
+    static uintptr_t base_addr = reinterpret_cast<uintptr_t>(GetModuleHandleA("Spider-Man2.exe"));
+    if (base_addr == 0) return 0;
+    
+    try {
+        // Read the exact integer from the static offset you found!
+        int character_id = *reinterpret_cast<int*>(base_addr + 0x99EA60C);
+        
+        // Sanity check: 0 = Peter, 1 = Miles, 2 = Venom
+        if (character_id >= 0 && character_id <= 2) {
+            return character_id;
+        }
+    } catch (...) {
+        // Silent failsafe in case the memory page isn't allocated during the first frame of boot
+    }
+    
+    return 0; // Default to Peter
+}
+
 namespace {
     constexpr int kMinRate = 0;
     constexpr int kMaxRate = 100;
@@ -563,10 +589,18 @@ namespace {
             in_safehouse = IsInSafehouse(pos);
         }
 
+        // Determine active character string for the UI
+        int active_char_id = g_active_character.load(std::memory_order_relaxed);
+        const char* char_name = "Testing Unknown ID...";
+        if (active_char_id == 0) char_name = "Peter (Expected)";
+        else if (active_char_id == 1) char_name = "Miles (Expected)";
+        else if (active_char_id == 2) char_name = "Venom (Expected)";
+
         // --- 5. FORMAT OUTPUT ---
         char buffer[1024];
         snprintf(buffer, sizeof(buffer),
             "--- SUIT DAMAGE V3 PERFORMANCE DEBUG ---\n"
+            "Active Character:  %s (Raw ID: %d)\n"
             "Suit Health:       %.2f%%\n"
             "Active Preset:     %d (Dmg Mult: %.2fx)\n"
             "Player Velocity:   %.1f units/sec\n"
@@ -581,6 +615,7 @@ namespace {
             "----------------------------------------\n"
             "Coords: X:%.1f Y:%.1f Z:%.1f\n"
             "Safehouse Status:  %s",
+            char_name, active_char_id,
             current_fraction * 100.0f,
             current_preset, g_damage_multiplier.load(std::memory_order_relaxed),
             g_player_speed.load(std::memory_order_relaxed),
@@ -652,6 +687,7 @@ namespace {
         DWORD last_log_tick = 0;
         DWORD last_heal_tick = last_tick;
         DWORD last_decay_tick = last_tick;
+        DWORD last_save_tick = GetTickCount();
 
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
@@ -675,6 +711,41 @@ namespace {
                 last_tick = now; // Keep delta zeroed out so we don't get massive time jumps
                 Sleep(16);
                 continue; // Skip all healing, wardrobe, and decay math this frame
+            }
+
+            // --- 0. BACKGROUND AUTO-SAVE ---
+            // Save persistent health to disk every 15 seconds
+            if (now - last_save_tick > 15000) {
+                SuitDamageManager::SaveSettingsToINI();
+                last_save_tick = now;
+            }
+
+            // --- 1. CHARACTER PERSISTENCE DETECTOR ---
+            int current_char = GetActiveCharacterId(); 
+            
+            if (current_char != g_active_character.load(std::memory_order_relaxed)) {
+                
+                // Save the outgoing character's exact health
+                int old_char = g_active_character.load(std::memory_order_relaxed);
+                if (old_char >= 0 && old_char <= 2) {
+                    g_character_health[old_char].store(GetCurrentSuitFraction(), std::memory_order_relaxed);
+                }
+                
+                // Update tracker and load incoming character's saved health
+                g_active_character.store(current_char, std::memory_order_relaxed);
+                if (current_char >= 0 && current_char <= 2) {
+                    float restored_health = g_character_health[current_char].load(std::memory_order_relaxed);
+                    
+                    SuitDamageManager::SetSuitHealthFraction(restored_health);
+                    LogHookStatus("Character Switch Detected: Restored persistent suit damage.");
+                }
+                
+                // Immediately save to INI on a character swap
+                SuitDamageManager::SaveSettingsToINI();
+                
+                // CRITICAL CRASH FIX: Force the thread to sleep before skipping the rest of the loop
+                Sleep(16); 
+                continue; 
             }
 
             // --- 1. WARDROBE CLEANSE ---
@@ -724,26 +795,16 @@ namespace {
                 DWORD now = GetTickCount();
                 if (now - last_log_tick > 1000) { 
                     
-                    // 1. Get the game's Hero System
                     HeroSystem* hero_sys = GetHeroSystem();
-                    if (hero_sys != nullptr) {
+                    if (hero_sys != nullptr && hero_sys->GetHero() != nullptr) {
+                        Vector3 pos = hero_sys->GetHero()->GetPosition();
                         
-                        // 2. Ask the system for Peter's master entity
-                        Actor* peter = hero_sys->GetHero();
-                        if (peter != nullptr) {
+                        char log_buffer[256];
+                        snprintf(log_buffer, sizeof(log_buffer), 
+                            "NATIVE SDK COORDS -> X: %.2f | Y: %.2f | Z: %.2f", 
+                            pos.x, pos.y, pos.z);
                             
-                            // 3. Grab his absolute 3D position directly from his Transform component
-                            Vector3 pos = peter->GetPosition();
-                            
-                            char log_buffer[256];
-                            snprintf(log_buffer, sizeof(log_buffer), 
-                                "NATIVE SDK COORDS -> X: %.2f | Y: %.2f | Z: %.2f", 
-                                pos.x, pos.y, pos.z);
-                                
-                            LogHookStatus(log_buffer);
-                        } else {
-                            LogHookStatus("HeroSystem found, but Peter's Actor is currently null (Loading/Dead?).");
-                        }
+                        LogHookStatus(log_buffer);
                     } else {
                         LogHookStatus("HeroSystem is not initialized yet.");
                     }
@@ -793,6 +854,17 @@ namespace SuitDamageManager {
         WriteFloat("CustomY", g_custom_y.load(std::memory_order_relaxed));
         WriteFloat("CustomZ", g_custom_z.load(std::memory_order_relaxed));
         WriteFloat("CustomRadius", g_custom_radius.load(std::memory_order_relaxed));
+
+        // Flush the current health on screen to the array before saving
+        int active_char = g_active_character.load(std::memory_order_relaxed);
+        if (active_char >= 0 && active_char <= 2) {
+            g_character_health[active_char].store(GetCurrentSuitFraction(), std::memory_order_relaxed);
+        }
+
+        // Save persistent states
+        WriteFloat("PeterHealth", g_character_health[0].load(std::memory_order_relaxed));
+        WriteFloat("MilesHealth", g_character_health[1].load(std::memory_order_relaxed));
+        WriteFloat("VenomHealth", g_character_health[2].load(std::memory_order_relaxed));
     }
 
     void LoadSettingsFromINI() {
@@ -820,6 +892,14 @@ namespace SuitDamageManager {
         g_custom_y.store(ReadFloat("CustomY", 0.0f), std::memory_order_relaxed);
         g_custom_z.store(ReadFloat("CustomZ", 0.0f), std::memory_order_relaxed);
         g_custom_radius.store(ReadFloat("CustomRadius", 0.0f), std::memory_order_relaxed);
+
+        g_character_health[0].store(ReadFloat("PeterHealth", 1.0f), std::memory_order_relaxed);
+        g_character_health[1].store(ReadFloat("MilesHealth", 1.0f), std::memory_order_relaxed);
+        g_character_health[2].store(ReadFloat("VenomHealth", 1.0f), std::memory_order_relaxed);
+        
+        // Default to Peter's health on boot (WorkerThread will instantly fix this if playing as Miles)
+        g_active_character.store(0, std::memory_order_relaxed);
+        SetSuitHealthFraction(g_character_health[0].load(std::memory_order_relaxed));
         
         LogHookStatus("SUCCESS: Settings loaded from SuitDamageConfig.ini");
     }

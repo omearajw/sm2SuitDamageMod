@@ -39,6 +39,8 @@ class Actor {
     char _0x72[0x38];
     char* name;
 public:
+    inline char* GetName() { return name; }
+
     inline ActorHandle GetHandle() {
         return ActorHandle(handle_upper, handle_lower);
     }

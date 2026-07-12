@@ -9,6 +9,9 @@ class HeroSystem {
     int _0x10;
     ActorHandle hero_handle;
 public:
+    // Expose the unknown integer to test if it's the character ID
+    inline int GetPlayerIndex() { return _0x10; }
+
     inline Actor* GetHero() {
         return GetActor(&hero_handle);
     }
