@@ -154,34 +154,64 @@ namespace {
         DWORD time_since_last = now - g_last_hook_tick.load(std::memory_order_relaxed);
         g_last_hook_tick.store(now, std::memory_order_relaxed);
 
-        // A true respawn ALWAYS involves a loading screen. 
-        // If this hook hasn't fired in > 2.5 seconds, the game was loading.
-        bool was_loading_screen = (time_since_last > 2500);
+        // State Machine Trackers
+        static bool s_evaluating_spawn = false;
+        static DWORD s_evaluation_start_time = 0;
+        static int s_last_hook_char_id = GetActiveCharacterId(); // Tracks the actively played character
+        static float s_pre_spawn_health = 1.0f; 
 
+        // --- 1. DETECT NEW ACTOR ---
         if (pointer != g_last_pointer) {
             g_last_pointer = pointer;
             g_player_pointer = pointer; 
             
-            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
+            s_pre_spawn_health = g_last_game_intended_value.load(std::memory_order_relaxed);
+            
+            // If the game was frozen/loading for > 250ms, enter the Evaluation Window
+            if (time_since_last > 250) {
+                s_evaluating_spawn = true;
+                s_evaluation_start_time = now;
+                // We DO NOT update s_last_hook_char_id here. It must remember the old character!
+            }
+        }
 
-            // --- TRUE RESPAWN DETECTOR ---
-            // Only punish the player if the pointer swapped, the game healed them, AND there was a loading screen.
-            // This completely ignores rapid cinematic QTEs like the car chase!
-            if (was_loading_screen && game_intended_value == 1.0f && last_val < 0.99f) {
-                int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+        // --- 2. EVALUATION WINDOW (500ms) ---
+        if (s_evaluating_spawn) {
+            int current_char = GetActiveCharacterId();
+            
+            // Condition A: Character ID changed. (Character Swap)
+            if (current_char != s_last_hook_char_id) {
+                s_evaluating_spawn = false;
+                LogHookStatus("Spawn Eval: Character Swap Confirmed. Aborting penalty.");
+            }
+            // Condition B: Engine healed the player. (Respawn / Fast Travel)
+            else if (game_intended_value >= 0.99f) {
+                s_evaluating_spawn = false;
                 
-                if (respawn_mode == 0) { // VANILLA
-                    g_suit_value = 1.0f; 
-                } else if (respawn_mode == 1) { // CINEMATIC
-                    // Maintain current damage
-                } else if (respawn_mode == 2) { // SURVIVOR
-                    g_suit_value = 0.0f; 
+                // Only punish if they were actually damaged before the load screen
+                if (s_pre_spawn_health < 0.99f) {
+                    int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+                    if (respawn_mode == 0) g_suit_value = 1.0f; 
+                    else if (respawn_mode == 2) g_suit_value = 0.0f; 
+                    LogHookStatus("Spawn Eval: True Respawn Confirmed. Penalty applied.");
+                } else {
+                    LogHookStatus("Spawn Eval: Fast Travel at full health. No penalty.");
                 }
             }
-            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
-            return g_suit_value;
+            // Condition C: 500ms timed out with no heal and no swap.
+            else if (now - s_evaluation_start_time > 500) {
+                s_evaluating_spawn = false;
+                LogHookStatus("Spawn Eval: Timeout. Treated as normal scene transition.");
+            }
+            
+            // Freeze UI health during evaluation to prevent visual glitches
+            if (s_evaluating_spawn) {
+                g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
+                return g_suit_value;
+            }
         }
         
+        // --- 3. NORMAL DAMAGE ACCUMULATION ---
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
             float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
             
@@ -195,12 +225,16 @@ namespace {
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
-            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         } else {
             g_suit_value = game_intended_value; 
-            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
 
+        // Keep the tracker accurate during normal gameplay
+        if (!s_evaluating_spawn) {
+            s_last_hook_char_id = GetActiveCharacterId();
+        }
+
+        g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         return g_suit_value; 
     }
 
@@ -360,6 +394,19 @@ namespace {
         if (g_player_pointer != 0) {
             *reinterpret_cast<float*>(g_player_pointer) = g_suit_value;
         }
+    }
+
+    void RestorePersistentHealthInternal(float normalized) {
+        normalized = std::clamp(normalized, 0.0f, 1.0f);
+        std::lock_guard<std::mutex> guard(g_suit_mutex);
+        
+        // Update the internal value so the hook has it ready
+        g_suit_value = normalized;
+
+        // CRITICAL FIX: The old actor is dead. Nullify the pointers 
+        // so background threads don't write to freed memory during the loading screen!
+        g_player_pointer = 0;
+        g_last_pointer = 0; 
     }
 
     bool IsInSafehouse(Vector3 pos) {
@@ -685,8 +732,6 @@ namespace {
 
         DWORD last_tick = GetTickCount();
         DWORD last_log_tick = 0;
-        DWORD last_heal_tick = last_tick;
-        DWORD last_decay_tick = last_tick;
         DWORD last_save_tick = GetTickCount();
 
         while (g_running.load(std::memory_order_relaxed)) {
@@ -705,22 +750,14 @@ namespace {
                 }
             }
 
-            // --- ENGINE PAUSE DETECTOR ---
-            // If the engine hasn't called the hook in over 200ms, the game is paused.
-            if (now - g_last_hook_tick.load(std::memory_order_relaxed) > 200) {
-                last_tick = now; // Keep delta zeroed out so we don't get massive time jumps
-                Sleep(16);
-                continue; // Skip all healing, wardrobe, and decay math this frame
-            }
-
-            // --- 0. BACKGROUND AUTO-SAVE ---
+            // --- -1. BACKGROUND AUTO-SAVE ---
             // Save persistent health to disk every 15 seconds
             if (now - last_save_tick > 15000) {
                 SuitDamageManager::SaveSettingsToINI();
                 last_save_tick = now;
             }
 
-            // --- 1. CHARACTER PERSISTENCE DETECTOR ---
+            // --- 0. CHARACTER PERSISTENCE DETECTOR ---
             int current_char = GetActiveCharacterId(); 
             
             if (current_char != g_active_character.load(std::memory_order_relaxed)) {
@@ -733,11 +770,13 @@ namespace {
                 
                 // Update tracker and load incoming character's saved health
                 g_active_character.store(current_char, std::memory_order_relaxed);
+                
                 if (current_char >= 0 && current_char <= 2) {
                     float restored_health = g_character_health[current_char].load(std::memory_order_relaxed);
                     
-                    SuitDamageManager::SetSuitHealthFraction(restored_health);
-                    LogHookStatus("Character Switch Detected: Restored persistent suit damage.");
+                    // SAFELY RESTORE HEALTH AND NULLIFY POINTERS
+                    SuitDamageManager::RestorePersistentHealth(restored_health);
+                    LogHookStatus("Character Switch Detected: Restored persistent suit damage safely.");
                 }
                 
                 // Immediately save to INI on a character swap
@@ -746,6 +785,14 @@ namespace {
                 // CRITICAL CRASH FIX: Force the thread to sleep before skipping the rest of the loop
                 Sleep(16); 
                 continue; 
+            }
+
+            // --- ENGINE PAUSE DETECTOR ---
+            // If the engine hasn't called the hook in over 200ms, the game is paused.
+            if (now - g_last_hook_tick.load(std::memory_order_relaxed) > 200) {
+                last_tick = now; // Keep delta zeroed out so we don't get massive time jumps
+                Sleep(16);
+                continue; // Skip all healing, wardrobe, and decay math this frame
             }
 
             // --- 1. WARDROBE CLEANSE ---
@@ -824,6 +871,10 @@ const char* kConfigPath = ".\\SuitDamageConfig.ini";
 
 namespace SuitDamageManager {
     bool g_we_initialized_minhook = false;
+
+    void RestorePersistentHealth(float health) {
+        RestorePersistentHealthInternal(health);
+    }
 
     void SaveSettingsToINI() {
         auto WriteFloat = [](const char* key, float val) {

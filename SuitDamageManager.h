@@ -16,6 +16,7 @@ namespace SuitDamageManager {
     void SetDecayInterval(int interval);
 
     void RepairSuit();
+    void RestorePersistentHealth(float health);
     void SetSuitHealthFraction(float normalized);
     void SetSuitHealthPercent(float percent);
     void ApplySuitDamage(float amount);
