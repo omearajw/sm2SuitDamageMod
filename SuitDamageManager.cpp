@@ -154,50 +154,85 @@ namespace {
         DWORD time_since_last = now - g_last_hook_tick.load(std::memory_order_relaxed);
         g_last_hook_tick.store(now, std::memory_order_relaxed);
 
-        static int s_last_hook_char_id = g_active_character.load(std::memory_order_relaxed);
+        static int s_last_hook_char_id = GetActiveCharacterId();
+        static bool s_evaluating = false;
+        static DWORD s_eval_start = 0;
+        static float s_pre_spawn_health = 1.0f;
 
         bool was_loading_screen = (time_since_last > 250);
 
+        // --- DETECT NEW ACTOR ---
         if (pointer != g_last_pointer) {
+            LogHookStatus("Detected new player pointer. Evaluating suit state...");
             g_last_pointer = pointer;
             g_player_pointer = pointer; 
             
-            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
+            s_pre_spawn_health = g_last_game_intended_value.load(std::memory_order_relaxed);
 
-            // Read the atomic WorkerThread already safely maintains — no raw memory access here.
-            int current_char_id = g_active_character.load(std::memory_order_relaxed);
-            bool is_character_swap = (current_char_id != s_last_hook_char_id);
-            
-            s_last_hook_char_id = current_char_id;
-
-            // --- EVALUATE YOUR LOGIC RULES ---
-            
-            if (is_character_swap) {
-                // RULE 3: ID Changed -> Unconditionally a Character Swap.
-                // We bypass the respawn penalty entirely and let the WorkerThread restore the health.
-                LogHookStatus("Hook: Character swap detected. Bypassing respawn penalty.");
-            } 
-            else if (was_loading_screen) {
-                // RULE 1: Downtime > 250ms AND ID is the same AND game heals -> Respawn
-                if (game_intended_value == 1.0f && last_val < 0.99f) {
-                    LogHookStatus("Hook: True respawn detected. Applying penalty.");
-                    int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
-                    
-                    if (respawn_mode == 0) { // VANILLA
-                        g_suit_value = 1.0f; 
-                    } else if (respawn_mode == 1) { // CINEMATIC
-                        // Maintain current damage
-                    } else if (respawn_mode == 2) { // SURVIVOR
-                        g_suit_value = 0.0f; 
-                    }
-                }
+            if (was_loading_screen) {
+                LogHookStatus("RULE 2: > 250ms -> Loading Screen. Entering waiting room...");
+                s_evaluating = true;
+                s_eval_start = now;
+            } else {
+                LogHookStatus("RULE 3: < 250ms -> Seamless QTE swap. Updating ID and ignoring.");
+                s_last_hook_char_id = GetActiveCharacterId();
+                g_active_character.store(s_last_hook_char_id, std::memory_order_relaxed);
             }
-            // RULE 2: If !is_character_swap AND !was_loading_screen, it skips -> QTE.
+        }
 
-            g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
-            return g_suit_value;
+        // --- THE WAITING ROOM ---
+        if (s_evaluating) {
+            // Wait for the engine to heal the player -> memory is now 100% stable!
+            if (game_intended_value >= 0.99f) {
+                int current_char_id = GetActiveCharacterId();
+
+                if (current_char_id == s_last_hook_char_id) {
+                    LogHookStatus("RULE 2: ID is the same -> True Respawn. Applying penalty...");
+                    if (s_pre_spawn_health < 0.99f) {
+                        int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+                        if (respawn_mode == 0) g_suit_value = 1.0f; 
+                        else if (respawn_mode == 2) g_suit_value = 0.0f; 
+                    }
+                } else {
+                    LogHookStatus("RULE 1: ID Changed -> True Character Swap. Restoring persistent health...");
+                    
+                    // 1. Safely store outgoing character's health
+                    if (s_last_hook_char_id >= 0 && s_last_hook_char_id <= 2) {
+                        g_character_health[s_last_hook_char_id].store(s_pre_spawn_health, std::memory_order_relaxed);
+                    }
+                    
+                    // 2. Safely load incoming character's health directly into the suit
+                    if (current_char_id >= 0 && current_char_id <= 2) {
+                        g_suit_value = g_character_health[current_char_id].load(std::memory_order_relaxed);
+                    }
+                    
+                    // 3. Update global trackers
+                    g_active_character.store(current_char_id, std::memory_order_relaxed);
+                    s_last_hook_char_id = current_char_id;
+                }
+                
+                s_evaluating = false;
+            } 
+            else if (now - s_eval_start > 500) {
+                LogHookStatus("Waiting room timeout exceeded. Exiting waiting room.");
+                s_evaluating = false;
+            }
+
+            if (s_evaluating) {
+                g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
+                return g_suit_value;
+            }
         }
         
+        // Keep tracker accurate during normal gameplay
+        if (!s_evaluating) {
+            int normal_poll_id = GetActiveCharacterId();
+            if (normal_poll_id != s_last_hook_char_id) {
+                s_last_hook_char_id = normal_poll_id;
+                g_active_character.store(normal_poll_id, std::memory_order_relaxed);
+            }
+        }
+
         // --- NORMAL DAMAGE ACCUMULATION ---
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
             float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
@@ -377,19 +412,6 @@ namespace {
         if (g_player_pointer != 0) {
             *reinterpret_cast<float*>(g_player_pointer) = g_suit_value;
         }
-    }
-
-    void RestorePersistentHealthInternal(float normalized) {
-        normalized = std::clamp(normalized, 0.0f, 1.0f);
-        std::lock_guard<std::mutex> guard(g_suit_mutex);
-        
-        // Update the internal value so the hook has it ready
-        g_suit_value = normalized;
-
-        // CRITICAL FIX: The old actor is dead. Nullify the pointers 
-        // so background threads don't write to freed memory during the loading screen!
-        g_player_pointer = 0;
-        g_last_pointer = 0; 
     }
 
     bool IsInSafehouse(Vector3 pos) {
@@ -748,35 +770,6 @@ namespace {
             if (now - last_save_tick > 15000) {
                 SuitDamageManager::SaveSettingsToINI();
                 last_save_tick = now;
-            }
-
-            // --- 1. CHARACTER PERSISTENCE DETECTOR ---
-            int current_char = GetActiveCharacterId(); 
-            
-            if (current_char != g_active_character.load(std::memory_order_relaxed)) {
-                
-                // Save the outgoing character's exact health
-                int old_char = g_active_character.load(std::memory_order_relaxed);
-                if (old_char >= 0 && old_char <= 2) {
-                    g_character_health[old_char].store(GetCurrentSuitFraction(), std::memory_order_relaxed);
-                }
-                
-                // Update tracker and load incoming character's saved health
-                g_active_character.store(current_char, std::memory_order_relaxed);
-                if (current_char >= 0 && current_char <= 2) {
-                    float restored_health = g_character_health[current_char].load(std::memory_order_relaxed);
-                    
-                    // CRITICAL CRASH FIX: Use the internal safe function to avoid writing to dead memory
-                    RestorePersistentHealthInternal(restored_health);
-                    LogHookStatus("Character Switch Detected: Restored persistent suit damage safely.");
-                }
-                
-                // Immediately save to INI on a character swap
-                SuitDamageManager::SaveSettingsToINI();
-                
-                // CRITICAL CRASH FIX: Force the thread to sleep before skipping the rest of the loop
-                Sleep(16); 
-                continue; 
             }
 
             // --- 1. WARDROBE CLEANSE ---
