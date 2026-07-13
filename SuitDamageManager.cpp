@@ -146,58 +146,56 @@ namespace {
     // Tracks the game's internal math state
     std::atomic<float> g_last_game_intended_value{1.0f};
     uintptr_t g_last_pointer = 0;
+    std::atomic<DWORD> g_last_swap_gap{0};
+    std::atomic<bool> g_pointer_swap_pending{false};
+    std::atomic<bool> g_death_zero_seen{false};
 
     extern "C" float SuitDamageLogic(uintptr_t pointer, float game_intended_value) {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
         
         DWORD now = GetTickCount();
-        DWORD time_since_last = now - g_last_hook_tick.load(std::memory_order_relaxed);
         g_last_hook_tick.store(now, std::memory_order_relaxed);
-
-        // A true respawn ALWAYS involves a loading screen. 
-        // If this hook hasn't fired in > 2.5 seconds, the game was loading.
-        bool was_loading_screen = (time_since_last > 2500);
 
         if (pointer != g_last_pointer) {
             g_last_pointer = pointer;
             g_player_pointer = pointer; 
-            
-            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
-
-            // --- TRUE RESPAWN DETECTOR ---
-            // Only punish the player if the pointer swapped, the game healed them, AND there was a loading screen.
-            // This completely ignores rapid cinematic QTEs like the car chase!
-            if (was_loading_screen && game_intended_value == 1.0f && last_val < 0.99f) {
-                int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
-                
-                if (respawn_mode == 0) { // VANILLA
-                    g_suit_value = 1.0f; 
-                } else if (respawn_mode == 1) { // CINEMATIC
-                    // Maintain current damage
-                } else if (respawn_mode == 2) { // SURVIVOR
-                    g_suit_value = 0.0f; 
-                }
-            }
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
             return g_suit_value;
         }
-        
+
+        float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
+
+        // The game only ever drives this to an exact 0.0f when HP has genuinely hit zero.
+        // Flag it, and only act on the very NEXT full-heal snap back to 1.0f — that pairing
+        // (real zero, then a full reset) is what a true respawn looks like.
+        if (game_intended_value == 0.0f) {
+            g_death_zero_seen.store(true, std::memory_order_relaxed);
+        }
+
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
-            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
-            
             if (game_intended_value < last_val) {
                 g_last_damage_tick.store(now, std::memory_order_relaxed);
-
                 float damage_taken = last_val - game_intended_value;
                 float mult = g_damage_multiplier.load(std::memory_order_relaxed);
                 float final_damage = (damage_taken * 0.12f) * mult; 
-                
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
+            else if (game_intended_value == 1.0f && last_val < 0.99f &&
+                    g_death_zero_seen.exchange(false, std::memory_order_relaxed)) {
+                // Confirmed real respawn.
+                int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+                if (respawn_mode == 0) {        // VANILLA
+                    g_suit_value = 1.0f;
+                } else if (respawn_mode == 1) { // CINEMATIC
+                    // maintain current damage — do nothing
+                } else if (respawn_mode == 2) { // SURVIVOR
+                    g_suit_value = 0.0f;
+                }
+            }
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         } else {
-            g_suit_value = game_intended_value; 
+            g_suit_value = game_intended_value;
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
 
@@ -706,11 +704,11 @@ namespace {
             }
 
             // --- ENGINE PAUSE DETECTOR ---
-            // If the engine hasn't called the hook in over 200ms, the game is paused.
+            // Replace the Engine Pause Detector block with this expanded version:
             if (now - g_last_hook_tick.load(std::memory_order_relaxed) > 200) {
-                last_tick = now; // Keep delta zeroed out so we don't get massive time jumps
+                last_tick = now;
                 Sleep(16);
-                continue; // Skip all healing, wardrobe, and decay math this frame
+                continue;
             }
 
             // --- 0. BACKGROUND AUTO-SAVE ---
@@ -720,32 +718,32 @@ namespace {
                 last_save_tick = now;
             }
 
-            // --- 1. CHARACTER PERSISTENCE DETECTOR ---
-            int current_char = GetActiveCharacterId(); 
-            
-            if (current_char != g_active_character.load(std::memory_order_relaxed)) {
-                
-                // Save the outgoing character's exact health
-                int old_char = g_active_character.load(std::memory_order_relaxed);
-                if (old_char >= 0 && old_char <= 2) {
-                    g_character_health[old_char].store(GetCurrentSuitFraction(), std::memory_order_relaxed);
+            static int s_pending_char_id = -1;
+
+            int current_char = GetActiveCharacterId();
+            int last_char = g_active_character.load(std::memory_order_relaxed);
+
+            if (current_char != last_char) {
+                if (s_pending_char_id == current_char) {
+                    // Confirmed on a second consecutive tick — genuine swap, not a transient misread.
+                    if (last_char >= 0 && last_char <= 2) {
+                        g_character_health[last_char].store(GetCurrentSuitFraction(), std::memory_order_relaxed);
+                    }
+                    g_active_character.store(current_char, std::memory_order_relaxed);
+                    if (current_char >= 0 && current_char <= 2) {
+                        float restored_health = g_character_health[current_char].load(std::memory_order_relaxed);
+                        SuitDamageManager::SetSuitHealthFraction(restored_health);
+                        LogHookStatus("Character Switch Detected: Restored persistent suit damage.");
+                    }
+                    SuitDamageManager::SaveSettingsToINI();
+                    s_pending_char_id = -1;
+                    Sleep(16);
+                    continue;
+                } else {
+                    s_pending_char_id = current_char; // seen once — wait for confirmation next tick
                 }
-                
-                // Update tracker and load incoming character's saved health
-                g_active_character.store(current_char, std::memory_order_relaxed);
-                if (current_char >= 0 && current_char <= 2) {
-                    float restored_health = g_character_health[current_char].load(std::memory_order_relaxed);
-                    
-                    SuitDamageManager::SetSuitHealthFraction(restored_health);
-                    LogHookStatus("Character Switch Detected: Restored persistent suit damage.");
-                }
-                
-                // Immediately save to INI on a character swap
-                SuitDamageManager::SaveSettingsToINI();
-                
-                // CRITICAL CRASH FIX: Force the thread to sleep before skipping the rest of the loop
-                Sleep(16); 
-                continue; 
+            } else {
+                s_pending_char_id = -1; // reset if it flickered back
             }
 
             // --- 1. WARDROBE CLEANSE ---
