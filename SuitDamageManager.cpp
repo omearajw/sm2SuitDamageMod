@@ -148,6 +148,7 @@ namespace {
     uintptr_t g_last_pointer = 0;
     std::atomic<DWORD> g_last_swap_gap{0};
     std::atomic<bool> g_pointer_swap_pending{false};
+    std::atomic<bool> g_death_zero_seen{false};
 
     extern "C" float SuitDamageLogic(uintptr_t pointer, float game_intended_value) {
         std::lock_guard<std::mutex> guard(g_suit_mutex);
@@ -161,10 +162,17 @@ namespace {
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
             return g_suit_value;
         }
-        
+
+        float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
+
+        // The game only ever drives this to an exact 0.0f when HP has genuinely hit zero.
+        // Flag it, and only act on the very NEXT full-heal snap back to 1.0f — that pairing
+        // (real zero, then a full reset) is what a true respawn looks like.
+        if (game_intended_value == 0.0f) {
+            g_death_zero_seen.store(true, std::memory_order_relaxed);
+        }
+
         if (g_accumulate_damage.load(std::memory_order_relaxed)) {
-            float last_val = g_last_game_intended_value.load(std::memory_order_relaxed);
-            
             if (game_intended_value < last_val) {
                 g_last_damage_tick.store(now, std::memory_order_relaxed);
                 float damage_taken = last_val - game_intended_value;
@@ -173,9 +181,21 @@ namespace {
                 g_suit_value = g_suit_value - final_damage;
                 if (g_suit_value < 0.0f) g_suit_value = 0.0f;
             }
+            else if (game_intended_value == 1.0f && last_val < 0.99f &&
+                    g_death_zero_seen.exchange(false, std::memory_order_relaxed)) {
+                // Confirmed real respawn.
+                int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
+                if (respawn_mode == 0) {        // VANILLA
+                    g_suit_value = 1.0f;
+                } else if (respawn_mode == 1) { // CINEMATIC
+                    // maintain current damage — do nothing
+                } else if (respawn_mode == 2) { // SURVIVOR
+                    g_suit_value = 0.0f;
+                }
+            }
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         } else {
-            g_suit_value = game_intended_value; 
+            g_suit_value = game_intended_value;
             g_last_game_intended_value.store(game_intended_value, std::memory_order_relaxed);
         }
 
@@ -666,8 +686,6 @@ namespace {
         DWORD last_heal_tick = last_tick;
         DWORD last_decay_tick = last_tick;
         DWORD last_save_tick = GetTickCount();
-        bool g_was_paused = false;
-        DWORD g_pause_started_tick = 0;
 
         while (g_running.load(std::memory_order_relaxed)) {
             HandleHotkeys();
@@ -688,20 +706,9 @@ namespace {
             // --- ENGINE PAUSE DETECTOR ---
             // Replace the Engine Pause Detector block with this expanded version:
             if (now - g_last_hook_tick.load(std::memory_order_relaxed) > 200) {
-                if (!g_was_paused) {
-                    g_was_paused = true;
-                    g_pause_started_tick = now;
-                }
                 last_tick = now;
                 Sleep(16);
                 continue;
-            }
-
-            bool just_resumed_from_long_pause = false;
-            if (g_was_paused) {
-                DWORD pause_duration = now - g_pause_started_tick;
-                just_resumed_from_long_pause = (pause_duration > 2500);
-                g_was_paused = false;
             }
 
             // --- 0. BACKGROUND AUTO-SAVE ---
@@ -737,19 +744,6 @@ namespace {
                 }
             } else {
                 s_pending_char_id = -1; // reset if it flickered back
-            }
-
-            if (just_resumed_from_long_pause && current_char == last_char) {
-                float current_val = GetCurrentSuitFraction();
-                if (current_val < 0.99f) {
-                    int respawn_mode = g_respawn_behavior.load(std::memory_order_relaxed);
-                    if (respawn_mode == 0) {
-                        SuitDamageManager::SetSuitHealthFraction(1.0f);
-                    } else if (respawn_mode == 2) {
-                        SuitDamageManager::SetSuitHealthFraction(0.0f);
-                    }
-                    LogHookStatus("True Respawn Detected: Applied respawn behavior.");
-                }
             }
 
             // --- 1. WARDROBE CLEANSE ---
