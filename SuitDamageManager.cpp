@@ -76,23 +76,33 @@ extern "C" {
 std::atomic<float> g_character_health[3] = {1.0f, 1.0f, 1.0f}; 
 std::atomic<int> g_active_character{0}; 
 
-// Reads the Active Character ID directly from the game's static memory
+// Reads the Active Character ID dynamically from game memory
 int GetActiveCharacterId() {
-    // Cache the base address so we only have to look it up once
     static uintptr_t base_addr = reinterpret_cast<uintptr_t>(GetModuleHandleA("Spider-Man2.exe"));
     if (base_addr == 0) return 0;
     
-    try {
-        // Read the exact integer from the static offset you found!
-        int character_id = *reinterpret_cast<int*>(base_addr + 0x99EA60C);
+    // We make this static so the heavy pattern scan only runs once
+    static uint32_t s_char_offset = 0;
+    if (s_char_offset == 0) {
+        const char* sig = "7F ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? 8B 80 ?? ?? ?? ?? 83 F8 02 76 ?? 33 C0 48 83 C4 28 C3";
+        Scan::ScanResult res = Scan::Internal::ScanModule("Spider-Man2.exe", sig);
         
-        // Sanity check: 0 = Peter, 1 = Miles, 2 = Venom
+        if (res.found) {
+            // The target instruction '8B 80 ?? ?? ?? ??' starts 14 bytes into our signature.
+            // The actual 4-byte offset starts 2 bytes into that instruction (14 + 2 = 16).
+            s_char_offset = *reinterpret_cast<uint32_t*>(res.loc + 16);
+        } else {
+            // Failsafe for your specific game version
+            s_char_offset = 0x0; 
+        }
+    }
+    
+    try {
+        int character_id = *reinterpret_cast<int*>(base_addr + s_char_offset);
         if (character_id >= 0 && character_id <= 2) {
             return character_id;
         }
-    } catch (...) {
-        // Silent failsafe in case the memory page isn't allocated during the first frame of boot
-    }
+    } catch (...) {}
     
     return 0; // Default to Peter
 }
@@ -679,7 +689,20 @@ namespace {
 
         HMODULE game_module = GetModuleHandleA("Spider-Man2.exe");
         uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
-        uintptr_t suit_id_pointer = base_address + 0xAFB6EE8;
+        
+        static uint32_t s_suit_offset = 0;
+        if (s_suit_offset == 0) {
+            const char* suit_sig = "89 3D ?? ?? ?? ?? 4D 85 ED 74 ?? 41 8B 9D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 3B D8 74 ??";
+            Scan::ScanResult res = Scan::Internal::ScanModule("Spider-Man2.exe", suit_sig);
+            if (res.found) {
+                // The target instruction '41 8B 9D ?? ?? ?? ??' starts 12 bytes into the signature.
+                // The actual 4-byte offset starts 3 bytes into it (12 + 3 = 15).
+                s_suit_offset = *reinterpret_cast<uint32_t*>(res.loc + 15);
+            } else {
+                s_suit_offset = 0x0; // Failsafe
+            }
+        }
+        uintptr_t suit_id_pointer = base_address + s_suit_offset;
 
         DWORD last_tick = GetTickCount();
         DWORD last_log_tick = 0;
