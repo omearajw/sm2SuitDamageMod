@@ -6,6 +6,9 @@ EXTERN g_return_address : QWORD
 EXTERN g_player_base: QWORD
 EXTERN g_coord_return: QWORD
 
+EXTERN g_wardrobe_return : QWORD
+EXTERN g_wardrobe_flag : BYTE
+
 .code
 
 ; --------------------------------------------------
@@ -79,5 +82,21 @@ MasterCoordinateHookAsm PROC
     ; 3. Jump back to the game seamlessly
     jmp qword ptr [g_coord_return]
 MasterCoordinateHookAsm ENDP
+
+; --------------------------------------------------
+; HOOK 3: WARDROBE SELECT DETOUR
+; --------------------------------------------------
+PUBLIC WardrobeHookDetourAsm
+WardrobeHookDetourAsm PROC
+    ; 1. Set our C++ flag to true (1)
+    mov byte ptr [g_wardrobe_flag], 1
+
+    ; 2. Execute the original 7 bytes of stolen instructions
+    mov r8, [r14]
+    shr r8, 20h
+
+    ; 3. Jump back to the game seamlessly
+    jmp qword ptr [g_wardrobe_return]
+WardrobeHookDetourAsm ENDP
 
 END

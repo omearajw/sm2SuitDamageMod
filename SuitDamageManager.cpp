@@ -26,6 +26,9 @@ uintptr_t g_player_pointer = 0;
 uintptr_t g_hook_target = 0;
 std::atomic<DWORD> g_last_hook_tick{0};
 bool g_hook_installed = false;
+extern "C" bool g_wardrobe_flag = false;
+extern "C" uintptr_t g_wardrobe_return = 0;
+extern "C" void WardrobeHookDetourAsm();
 
 // --- ANALYTICS GLOBALS ---
 std::mutex g_analytics_mutex;
@@ -76,36 +79,7 @@ extern "C" {
 std::atomic<float> g_character_health[3] = {1.0f, 1.0f, 1.0f}; 
 std::atomic<int> g_active_character{0}; 
 
-// Reads the Active Character ID dynamically from game memory
-int GetActiveCharacterId() {
-    static uintptr_t base_addr = reinterpret_cast<uintptr_t>(GetModuleHandleA("Spider-Man2.exe"));
-    if (base_addr == 0) return 0;
-    
-    // We make this static so the heavy pattern scan only runs once
-    static uint32_t s_char_offset = 0;
-    if (s_char_offset == 0) {
-        const char* sig = "7F ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? 8B 80 ?? ?? ?? ?? 83 F8 02 76 ?? 33 C0 48 83 C4 28 C3";
-        Scan::ScanResult res = Scan::Internal::ScanModule("Spider-Man2.exe", sig);
-        
-        if (res.found) {
-            // The target instruction '8B 80 ?? ?? ?? ??' starts 14 bytes into our signature.
-            // The actual 4-byte offset starts 2 bytes into that instruction (14 + 2 = 16).
-            s_char_offset = *reinterpret_cast<uint32_t*>(res.loc + 16);
-        } else {
-            // Failsafe for your specific game version
-            s_char_offset = 0x0; 
-        }
-    }
-    
-    try {
-        int character_id = *reinterpret_cast<int*>(base_addr + s_char_offset);
-        if (character_id >= 0 && character_id <= 2) {
-            return character_id;
-        }
-    } catch (...) {}
-    
-    return 0; // Default to Peter
-}
+
 
 namespace {
     constexpr int kMinRate = 0;
@@ -152,6 +126,27 @@ namespace {
             g_debug_log.flush();
         }
     }
+
+    // Reads the Active Character ID directly from the game's static memory
+    int GetActiveCharacterId() {
+            // Cache the base address so we only have to look it up once
+            static uintptr_t base_addr = reinterpret_cast<uintptr_t>(GetModuleHandleA("Spider-Man2.exe"));
+            if (base_addr == 0) return 0;
+            
+            try {
+                // Read the exact integer from your known working static offset
+                int character_id = *reinterpret_cast<int*>(base_addr + 0x99EA60C);
+                
+                // Sanity check: 0 = Peter, 1 = Miles, 2 = Venom
+                if (character_id >= 0 && character_id <= 2) {
+                    return character_id;
+                }
+            } catch (...) {
+                // Failsafe in case of memory violation
+            }
+            
+            return 0; // Default to Peter
+        }
 
     // Tracks the game's internal math state
     std::atomic<float> g_last_game_intended_value{1.0f};
@@ -305,6 +300,48 @@ namespace {
         }
 
         LogHookStatus("CRITICAL ERROR: VirtualProtect failed on game memory.");
+        return false;
+    }
+
+    bool InstallWardrobeHook() {
+        LogHookStatus("Attempting to install Wardrobe Event Hook...");
+
+        // This signature has no hardcoded offsets, making it incredibly stable across updates
+        const char* wardrobe_sig = "48 8B 08 48 8B D1 48 C1 EA 20 4D 8B 06 49 C1 E8 20 4D 8B C8";
+        Scan::ScanResult result = Scan::Internal::ScanModule("Spider-Man2.exe", wardrobe_sig);
+        
+        if (!result.found) {
+            LogHookStatus("WARNING: Wardrobe signature not found. Cleanse disabled.");
+            return false;
+        }
+
+        // The exact instruction we want to hook starts 10 bytes into our signature
+        uintptr_t hook_target = result.loc + 10;
+        
+        // We are stealing 7 bytes (mov r8,[r14] + shr r8,20)
+        g_wardrobe_return = hook_target + 7; 
+
+        void* trampoline = AllocateNear(hook_target);
+        if (!trampoline) return false;
+
+        uint8_t* t = reinterpret_cast<uint8_t*>(trampoline);
+        t[0] = 0xFF; t[1] = 0x25; t[2] = 0x00; t[3] = 0x00; t[4] = 0x00; t[5] = 0x00;
+        *reinterpret_cast<uintptr_t*>(t + 6) = reinterpret_cast<uintptr_t>(&WardrobeHookDetourAsm);
+
+        DWORD old_protect;
+        if (VirtualProtect(reinterpret_cast<LPVOID>(hook_target), 7, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            uint8_t* p = reinterpret_cast<uint8_t*>(hook_target);
+            p[0] = 0xE9; 
+            *reinterpret_cast<int32_t*>(p + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(trampoline) - hook_target - 5);
+            
+            // Pad the remaining 2 bytes with NOPs
+            p[5] = 0x90; 
+            p[6] = 0x90;
+            
+            VirtualProtect(reinterpret_cast<LPVOID>(hook_target), 7, old_protect, &old_protect);
+            LogHookStatus("SUCCESS: Wardrobe Event Hook installed!");
+            return true;
+        }
         return false;
     }
 
@@ -684,25 +721,15 @@ namespace {
             LogHookStatus("Delaying hook install by 3000ms...");
             Sleep(kHookInstallDelayMs);
             InstallSuitDamageHook();
+            InstallWardrobeHook();
             InstallCoordinateHook(); 
         }
 
         HMODULE game_module = GetModuleHandleA("Spider-Man2.exe");
         uintptr_t base_address = reinterpret_cast<uintptr_t>(game_module);
         
-        static uint32_t s_suit_offset = 0;
-        if (s_suit_offset == 0) {
-            const char* suit_sig = "89 3D ?? ?? ?? ?? 4D 85 ED 74 ?? 41 8B 9D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 3B D8 74 ??";
-            Scan::ScanResult res = Scan::Internal::ScanModule("Spider-Man2.exe", suit_sig);
-            if (res.found) {
-                // The target instruction '41 8B 9D ?? ?? ?? ??' starts 12 bytes into the signature.
-                // The actual 4-byte offset starts 3 bytes into it (12 + 3 = 15).
-                s_suit_offset = *reinterpret_cast<uint32_t*>(res.loc + 15);
-            } else {
-                s_suit_offset = 0x0; // Failsafe
-            }
-        }
-        uintptr_t suit_id_pointer = base_address + s_suit_offset;
+        // Use your known working static offset for the active Suit ID
+        uintptr_t suit_id_pointer = base_address + 0xAFB6EE8;
 
         DWORD last_tick = GetTickCount();
         DWORD last_log_tick = 0;
@@ -770,16 +797,12 @@ namespace {
             }
 
             // --- 1. WARDROBE CLEANSE ---
-            if (base_address != 0) {
-                uint32_t current_suit_id = *reinterpret_cast<uint32_t*>(suit_id_pointer);
-                if (current_suit_id != g_last_suit_id.load(std::memory_order_relaxed)) {
-                    if (g_last_suit_id.load(std::memory_order_relaxed) != 0) {
-                        if (g_wardrobe_heal_enabled.load(std::memory_order_relaxed)) {
-                            SuitDamageManager::SetSuitHealthFraction(1.0f);
-                            LogHookStatus("Suit changed: Wardrobe Cleanse applied.");
-                        }
-                    }
-                    g_last_suit_id.store(current_suit_id, std::memory_order_relaxed);
+            if (g_wardrobe_flag) {
+                g_wardrobe_flag = false; // Reset the flag immediately
+                
+                if (g_wardrobe_heal_enabled.load(std::memory_order_relaxed)) {
+                    SuitDamageManager::SetSuitHealthFraction(1.0f);
+                    LogHookStatus("Wardrobe Event Hooked: Wardrobe Cleanse applied.");
                 }
             }
 
